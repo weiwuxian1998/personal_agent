@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from agents.base import build_agent
+from agents.middleware import VisionAdapterMiddleware
 from agents.prompt import worker_prompt
 from config import Settings
 from contracts import TaskSpec
@@ -29,5 +32,6 @@ def build_worker(*, task: TaskSpec, settings: Settings, checkpointer: Any):
         tools=tools,
         system_prompt=worker_prompt(settings),
         checkpointer=checkpointer,
+        middleware=[VisionAdapterMiddleware(settings)],
         name="worker",
     )

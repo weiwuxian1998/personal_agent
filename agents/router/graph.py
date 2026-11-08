@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.base import build_agent
+from agents.middleware import VisionAdapterMiddleware
 from agents.prompt import router_prompt
 from config import Settings
 from tools.reply import build_reply_user_tool
@@ -28,5 +29,6 @@ def build_router(
         tools=tools,
         system_prompt=router_prompt(settings),
         checkpointer=checkpointer,
+        middleware=[VisionAdapterMiddleware(settings)],
         name="router",
     )

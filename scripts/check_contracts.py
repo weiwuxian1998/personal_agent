@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 from agents.vision import adapt_content, adapt_messages  # noqa: E402
 from bus.envelope import event_from_redis, event_to_redis, new_event, render_digest  # noqa: E402
-from contracts import Event, IncomingMessage, SendResult, TaskSpec, parse_iso, ulid  # noqa: E402
+from contracts import EVENT_SOURCES, Event, IncomingMessage, SendResult, TaskSpec, parse_iso, ulid  # noqa: E402
 
 
 def main() -> int:
@@ -84,6 +84,18 @@ def main() -> int:
     adapted = adapt_messages(original, supports_vision=False)
     check("adapt_messages_no_mutation", original[0].content == blocks)
     check("adapt_messages_new_content", "image_url" not in [b.get("type") for b in adapted[0].content])
+
+    # 渠道工厂：console 模式不得把 lark_oapi 拖进导入（实测导入 47s）
+    from bus.stream import Bus  # noqa: E402
+    from channel.factory import build_channel  # noqa: E402
+    from config import settings  # noqa: E402
+
+    settings.channel_kind = "console"
+    channel = build_channel(settings)
+    check("channel_factory_console", channel.name == "console")
+    check("channel_factory_lazy_lark", "lark_oapi" not in sys.modules)
+    check("bus_lag_exists", callable(getattr(Bus, "lag", None)))
+    check("event_source_console", "console" in EVENT_SOURCES)
 
     print(f"\n{len(failures)} failure(s)")
     return 1 if failures else 0

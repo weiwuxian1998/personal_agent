@@ -177,6 +177,24 @@ class Bus:
         # 旧版本 redis-py 返回 summary 列表形式
         return bool(info)
 
+    def lag(self) -> int:
+        """消费者组尚未投递的事件数（Redis 7 `XINFO GROUPS` 的 `lag`）。
+
+        gateway 的 supervisor 用它判断「有活要干」，不能用 `XLEN`：
+        XACK 不会删除条目，`XLEN` 永远大于 0，会导致 router 被反复拉起。
+        旧版本 Redis 没有 `lag` 字段时退化为「未确认数」，只影响拉起时机，不丢事件。
+        """
+        groups = self.client.xinfo_groups(self.stream) or []
+        for group in groups:
+            normalized = {_text(k): v for k, v in group.items()}
+            if normalized.get("name") != self.group:
+                continue
+            value = normalized.get("lag")
+            if value is not None:
+                return int(value)
+            return int(normalized.get("pending", 0) or 0)
+        return 0
+
     def xlen(self) -> int:
         return int(self.client.xlen(self.stream))
 

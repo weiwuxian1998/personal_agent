@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -12,14 +13,21 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# 凭证只从既有 .env 读取；可用 ASSISTANT_ENV_FILE 指向仓库外的凭证文件，
+# 避免把真实密钥复制进新仓库（复制本身也违反"不提交密钥"的约束）。
+ENV_FILE = Path(os.getenv("ASSISTANT_ENV_FILE", str(BASE_DIR / ".env")))
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=BASE_DIR / ".env",
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
     )
+
+    # ---------- 渠道 ----------
+    channel_kind: str = "feishu"          # "feishu" | "console"
 
     # ---------- 飞书 ----------
     feishu_app_id: str = ""

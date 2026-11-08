@@ -39,7 +39,10 @@ EVENT_TYPES: frozenset[str] = frozenset(
 )
 
 # 固定来源枚举（用于校验信封，不限制 payload）
-EVENT_SOURCES: frozenset[str] = frozenset({"feishu", "worker", "scheduler", "router", "system"})
+# `console` 是本地调试渠道（契约 §6.3）；正式渠道只有 `feishu`。
+EVENT_SOURCES: frozenset[str] = frozenset(
+    {"feishu", "console", "worker", "scheduler", "router", "system"}
+)
 
 ToolProfile = Literal["router", "worker"]
 SessionStatus = Literal["running", "waiting_router", "idle", "stopped", "error", "done", "unreachable"]

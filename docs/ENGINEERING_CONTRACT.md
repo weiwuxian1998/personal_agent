@@ -164,6 +164,7 @@ class Bus:
     def ack(self, entries: list[tuple[str, Event]]) -> None
     def claim_pending(self, *, min_idle_ms=60000, count=10) -> list[tuple[str, Event]]
     def pel_nonempty(self) -> bool
+    def lag(self) -> int                      # XINFO GROUPS 的 lag；组内尚未投递的事件数
     def xlen(self) -> int
 
 # 模块级（不是 Bus 方法）：飞书 gateway 与 ReplyUser 共用的原子去重
@@ -174,7 +175,10 @@ def try_dedupe(client: redis.Redis, dedupe_key: str, *, ttl_s: int = 6*3600) -> 
 - `try_dedupe` 用单条 `SET NX EX`，并发安全；入队失败必须删除该键，否则消息永久丢失；
 - 阻塞读连接必须 `socket_timeout=None`（或 ≥ 2×block），与命令连接分开；
 - `MAXLEN ~` 近似裁剪；
-- 未 ACK 的条目留在 PEL，崩溃后 `XAUTOCLAIM`。
+- 未 ACK 的条目留在 PEL，崩溃后 `XAUTOCLAIM`；
+- **supervisor 判断「有没有活」必须用 `lag()` + `pel_nonempty()`，不能用 `XLEN`**：
+  `XACK` 不删除条目，`XLEN` 永远大于 0，用它会反复拉起 router（已实测）。
+  旧版 Redis 没有 `lag` 字段时，`lag()` 退化为 `pending` 数，只影响拉起时机。
 
 ---
 
@@ -353,6 +357,23 @@ class Channel(ABC):
 ### 6.3 `channel/console.py`（M-CHANNEL）
 
 `ConsoleChannel.run_forever` 从 stdin 读行，构造 `IncomingMessage(channel="console", chat_id="console", message_id=ulid(), ...)`；`send_text` 打印到 stdout 并返回 `SendResult(ok=True, message_id=ulid())`。用于无飞书环境的闭环调试。
+
+### 6.4 `channel/factory.py`（主线，新增）
+
+```python
+def build_channel(settings: Settings) -> Channel   # 读 settings.channel_kind：feishu | console
+```
+
+- gateway（`run_forever`）与 router（`send_text`）**必须**用同一个工厂选渠道，禁止在两个入口里各写一份。
+- **必须惰性导入 `channel.feishu`**：`import lark_oapi` 实测 47.2 s（加载数千个 API 模型模块）。控制台模式与 worker 进程不应为飞书导入付启动代价。
+- 未知 `channel_kind` 直接抛错，不静默降级。
+
+### 6.5 channel → Redis 状态上报（已决定，v1 不做）
+
+- **v1 不创建 `asst:channel:state` 之类的键。**
+- 渠道健康只有两个出口：结构化日志（每条发送的 `ok/code/error/耗时`）与 `SendResult` 字段；渠道存活由 gateway 进程本身承担（进程在 = 渠道在）。
+- 理由：单 gateway 单渠道下新增状态键没有消费者，只会产生一份没人读的真相；多实例/多渠道路由是 v2 的事。
+- 若未来需要跨进程观测渠道状态，必须由主线先写契约（键名、字段、TTL、写入者），不许各模块自行发明。
 
 ---
 
@@ -681,20 +702,23 @@ def build_worker(task: TaskSpec, settings, checkpointer, redis_client) -> Compil
 ### 9.1 router 一轮
 
 ```
-XAUTOCLAIM(60s) → loop:
-  touch heartbeat(TTL 10s)
-  batch = read_batch(block=5000)
-  if empty: idle += 5; idle≥60 且 PEL 空 → 删 heartbeat、退出
+启动: ensure group → 起 heartbeat 线程（TTL 10s，每 5s 续期）
+      XAUTOCLAIM(5s 空闲) 认领上次崩溃遗留 → loop:
+  batch = read_batch(block=router_read_block_ms)
+  if empty: 有 PEL → claim_pending(5s)；仍空且 lag==0 且 idle≥60s → 删 heartbeat、退出 0
   batch = drain_more(batch, debounce=200ms, max=10)
-  写 inbox-*.jsonl
-  trace_id = ulid(); 写本批最后一条用户消息的 chat_id 到 asst:router:state
-  graph.invoke({"messages":[HumanMessage(render_digest(batch))]},
-               config={thread_id:"router:main", metadata:{trace_id}, recursion_limit:30})
+  写 inbox-*.jsonl（每条事件一行）
+  worker_result 事件：更新 sessions.status / first_message_at（router 的职责，worker 不写业务表）
+  chat_id/chat_type/trace_id 从本批用户消息取 → contextvar + asst:router:state.last_chat_id
+  graph.invoke({"messages":[{"role":"user","content":render_digest(batch)}]},
+               config={thread_id:"router:main", recursion_limit=30})
   写 turns-*.jsonl（append+fsync）→ ACK
 ```
 
-- 失败不 ACK，sleep 1s 重放；
-- `ReplyUser` 幂等键 `trace_id + ":" + reply_index`。
+- 失败**不 ACK**，进程以退出码 2 退出；事件留在 PEL，下次启动重放（没有逐事件重试预算，
+  由 gateway 的 supervisor 负责有限次重试，见 9.3）；
+- `ReplyUser` 幂等键 `trace_id + ":" + reply_index`；
+- 退出前必须满足 `lag()==0`，否则可能漏掉刚到达、尚未投递的事件（已实测）。
 
 ### 9.2 worker 生命周期
 
@@ -703,6 +727,8 @@ XAUTOCLAIM(60s) → loop:
 - `TaskOutput`：`first_message_at IS NULL` → `no_update`；否则读最新 checkpoint（**只读**），`pid_alive` 用 `(pid, pid_started_at)` 二元组（±2s）；
 - `StopCommand`：一级不打断当前工具；一级返回后写 `stop_key=1`；二级 60–90s 未收尾 → `stop_key=2` + `TerminateJobObject`/`taskkill /F /T`，并写用户可见 `task_abort` 记录（`ReplyUser` 或 `approval_log`）；
 - 巡检 `reason ∈ {stalled, process_gone}`；`UNIQUE(task_id, reason)` 去重；**绝不自动重派**。
+- **失败也必须回传**：`worker_runner.py` 无论成功失败都 `XADD worker_result`（失败时 `status="error"`，正文给失败层与原因），并把结果落盘到 `workers/<task_id>/result.json`；否则 router 永远收不到回报。
+- 子进程一律用 `python -u` 启动：否则崩溃现场会因 stdout 缓冲整段丢失（已实测）。
 
 ### 9.3 supervisor
 
@@ -711,6 +737,18 @@ def supervisor_loop(settings, bus, store, stop_event)   # 1s 心跳/待处理；
 ```
 
 只 `XADD` 事件，不 import LLM、不执行任务。
+
+已实现的 router supervisor（gateway 内线程）：
+
+```
+每 1s:
+  回收已退出的 router 子进程（正常 0 / 异常非 0 分别计数）
+  若 有未投递(lag>0) 或 PEL 非空，且 heartbeat 不存在，且抢到 asst:router:spawning 锁 → Popen(python -u main_router.py)
+  异常连续 ≥5 次 → 停止拉起（多半是环境/凭证问题，继续拉只会刷日志）
+```
+
+- 拉起条件**不能用 `XLEN`**（见 §4）；
+- 命令行 `--console` 必须透传给 router，保证收发用同一种渠道。
 
 ---
 
@@ -750,7 +788,9 @@ def supervisor_loop(settings, bus, store, stop_event)   # 1s 心跳/待处理；
 | `scripts/check_store.py` | M-STORE | — | ❌ | 退出码 0 |
 | `channel/feishu.py` | M-CHANNEL | lark-oapi, channel.base | ❌ | `scripts/check_channel.py` |
 | `channel/console.py` | M-CHANNEL | channel.base | ❌ | 同上 |
+| `channel/factory.py` | M0 主线 | channel.*, config | ❌ | `scripts/check_contracts.py` |
 | `scripts/check_channel.py` | M-CHANNEL | — | ❌ | 退出码 0 |
+| `tools/__init__.py` | M0 主线 | — | ❌ | `python -c "import tools"` |
 | `tools/reply.py` | M-ROUTER | channel.base, redis | ❌ | `scripts/check_router_tools.py` |
 | `tools/schedule.py` | M-ROUTER | store | ❌ | 同上 |
 | `tools/profile.py` | M-ROUTER | contracts | ❌ | 同上 |
@@ -840,7 +880,16 @@ requirements.txt
 | 7 | `check_memory`：预算裁剪保留最后 HumanMessage、tool 成对；折叠切点安全 | 全过 |
 | 8 | `scripts/selfcheck.py`：Redis group、PG checkpoint 读写、SQLite 表、工具路径守卫 | 退出码 0 |
 | 9 | `scripts/check_contracts.py`：`adapt_messages` 在 `llm_supports_vision=False` 时把 image 块换成文本、文本块保留；`True` 时原样返回 | 全过 |
-| 10 | 端到端：手机发"你好" → router 回 ReplyUser；派"看下 workspace 有什么" → worker_result → router 再回一次 | 手机实收两条 |
+| 10 | 端到端：手机发"你好" → router 回 ReplyUser；派"看下 workspace 有什么" → worker_result → router 再回一次 | 未完成：缺 LLM 凭证（见下方实测记录） |
+
+**端到端实测记录（2026-11-08，console 模式）**
+
+- ✅ `gateway --send` → 入队 → supervisor 拉起 router 子进程 → 消费者组读到消息（`lag` 归零）
+- ✅ router 装配成功（`create_agent` + 9 个工具：ReplyUser + 8 个 session 工具）
+- ✅ worker 真实拉起：`create_session` → `worker_runner.py` → 读到 `task.json` → 失败仍 `XADD worker_result(status="error")` → sessions 行转为 `error` 且写入 `first_message_at`
+- ✅ gateway 对异常退出按退避策略重拉，连续 5 次后停止；`Ctrl-C`/超时停止子进程无残留
+- ❌ **阻塞层：LLM 凭证缺失**。当前 `.env` 的 `LLM_API_KEY` / `LLM_BASE_URL` 为空，模型调用返回 `401`（`https://api.openai.com/v1/chat/completions`），router 因此无法产生任何工具调用，闭环停在"模型层"。
+  该层一旦可用，`ReplyUser → channel.send_text` 是唯一未跑的路径（其余链路均已实测通）。
 
 ---
 
@@ -870,6 +919,16 @@ requirements.txt
 | 20 | cron 只支持标准 5 段数字语法 | 接受（v1 限制）：不支持 `JAN`/`L`/`W`；非法表达式抛 `ValueError` |
 | 21 | M-STORE 验收留下 Redis 空 stream + 组 `router`、PG schema `mstore_check` | 保留：生产 `public` 已核对未变；组可在 selfcheck 复用，`mstore_check` 不参与生产 |
 | 22 | `read_records` 按目录读取全部 `*.jsonl`（不按前缀过滤） | 接受：router 的 memory 目录只放 turns/inbox/tools 三类，读取方自行按字段过滤 |
+| 23 | `tools/` 目录此前没有 `__init__.py`（不在归属表），以命名空间包工作 | **补 `__init__.py`，按显式包管理**；与 `bus/`、`channel/`、`agents/` 统一；文件归 M0 |
+| 24 | 契约未定义 channel→Redis 的"状态上报"键 | **v1 不建键**（见 §6.5）；健康信息只走结构化日志 + `SendResult`；未来要建键必须主线先写契约 |
+| 25 | `EVENT_SOURCES` 原本没有 `console`，而 `ConsoleChannel` 就是合法来源 | 已加入 `{"console"}`；`source` 校验放宽为 6 值，业务语义不变 |
+| 26 | router / gateway 都需要"选渠道"，契约没有工厂 | 新增 `channel/factory.py`（§6.4）；**必须惰性导入 feishu**：`import lark_oapi` 实测 47.2s |
+| 27 | 子进程 stdout 重定向到文件时，崩溃日志会因缓冲丢失 | 所有子进程统一 `python -u` 启动（router 由 supervisor 拉起、worker 由 `create_session` 拉起） |
+| 28 | 用 `XLEN` 判断"是否有活"会把 router 反复拉起（XACK 不删条目） | supervisor 改用 `XGROUP lag` + `pel_nonempty`（`Bus.lag()`，§4.3） |
+| 29 | 设计文档 §9.1 写"失败后 sleep 1s 重放" | 实现为**进程退出码 2 + PEL 保留**，由 supervisor 有限次（5 次、指数退避）重拉；进程内不 sleep 重放 |
+| 30 | 设计文档写 worker 完成后回传结果，未规定失败路径 | 失败也必须 `XADD worker_result(status="error")`，否则 router 永远等不到回报（§9.2） |
+| 31 | `Thread` 子类把停机事件命名为 `_stop` 会遮蔽 `threading.Thread._stop()`，`join()` 抛 `TypeError` | 统一命名 `_stop_event`（已实测踩坑，写进契约防复发） |
+| 32 | `ReplyUser` 工厂函数漏 `return`，导致工具列表里出现 `None`，`create_agent` 报 `'function' object has no attribute 'name'` | 已修；`build_*_tools()` 必须有返回值，工具对象类型断言留给 `check_router_tools` |
 
 ---
 

@@ -1,0 +1,70 @@
+"""契约自检：不依赖 Redis/Postgres/飞书，验证冻结文件的行为。
+
+用法：python scripts/check_contracts.py
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from bus.envelope import event_from_redis, event_to_redis, new_event, render_digest  # noqa: E402
+from contracts import Event, IncomingMessage, SendResult, TaskSpec, parse_iso, ulid  # noqa: E402
+
+
+def main() -> int:
+    failures: list[str] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f"  {detail}" if detail and not cond else ""))
+        if not cond:
+            failures.append(name)
+
+    ids = [ulid() for _ in range(1000)]
+    check("ulid_unique", len(set(ids)) == 1000)
+    check("ulid_len", all(len(i) == 26 for i in ids))
+
+    e = new_event("user_message", "feishu", {"text": "你好", "chat_id": "oc_x", "message_id": "om_1"})
+    raw = event_to_redis(e)
+    e2 = event_from_redis(raw)
+    check("event_roundtrip", e2.to_dict() == e.to_dict())
+    check("event_trace_default", e.trace_id == e.id)
+
+    digest = render_digest(
+        [
+            e,
+            new_event("worker_result", "worker", {"task_id": "worker:01ABC", "text": "完成了"}),
+            new_event("timer", "scheduler", {"schedule_id": "s1", "prompt": "该喝水了"}),
+        ]
+    )
+    check("digest_has_user", "用户" in digest)
+    check("digest_has_worker", "完成任务" in digest or "完成" in digest)
+    check("digest_has_reply_hint", "ReplyUser" in digest)
+
+    try:
+        Event(type="unknown", source="system", payload={})
+    except ValueError:
+        check("event_rejects_unknown_type", True)
+    else:
+        check("event_rejects_unknown_type", False)
+
+    check("parse_iso_utc", parse_iso("2026-11-08T12:00:00Z").hour == 12)
+    check("task_roundtrip", TaskSpec.from_json(TaskSpec(task_id=ulid(), prompt="p", title="t",
+                                                         trace_id="tr", cwd="C:/x",
+                                                         workspace_root="C:/w").to_json()).task_id != "")
+
+    im = IncomingMessage(channel="console", chat_id="console", chat_type="p2p",
+                         message_id="m1", event_id="e1", sender_id="u1",
+                         text="hi", create_time=0)
+    check("incoming_message", im.text == "hi")
+    check("send_result", SendResult(ok=True, message_id="om_2").ok)
+
+    print(f"\n{len(failures)} failure(s)")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

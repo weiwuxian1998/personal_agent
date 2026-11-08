@@ -113,7 +113,7 @@ def tool_error(code, message, *, hint="", **extra) -> dict   # {"ok":False,...}
 
 ---
 
-## 4. Redis 协议（`bus/envelope.py` 冻结 + `bus/stream.py` 主线实现）
+## 4. Redis 协议（`bus/envelope.py` 冻结 + `bus/stream.py` 由 M-STORE 实现、主线维护）
 
 ### 4.1 Key 常量（已提交）
 
@@ -150,13 +150,14 @@ payload 字段（按 type）：
 | `timer` | `schedule_id, scheduled_at, prompt` |
 | `system` | `kind`（`task_watch` 时带 `task_id, reason`） |
 
-### 4.3 `Bus` 类（`bus/stream.py`，主线）
+### 4.3 `Bus` 类（`bus/stream.py`，M-STORE 实现，主线维护）
 
 ```python
 class Bus:
     def __init__(self, client: redis.Redis): ...
     def ensure_router_group(self) -> None
     def ensure_worker_group(self, task_id: str) -> None
+    def worker_consumer_name(self, task_id: str) -> str       # = "w-<task>-1"
     def xadd(self, event: Event, *, stream: str = ROUTER_STREAM, maxlen: int = ROUTER_STREAM_MAXLEN) -> str
     def read_batch(self, *, block_ms=5000, count=10) -> list[tuple[str, Event]]
     def drain_more(self, first, *, debounce_ms=200, max_batch=10) -> list[tuple[str, Event]]
@@ -164,8 +165,13 @@ class Bus:
     def claim_pending(self, *, min_idle_ms=60000, count=10) -> list[tuple[str, Event]]
     def pel_nonempty(self) -> bool
     def xlen(self) -> int
+
+# 模块级（不是 Bus 方法）：飞书 gateway 与 ReplyUser 共用的原子去重
+def try_dedupe(client: redis.Redis, dedupe_key: str, *, ttl_s: int = 6*3600) -> bool
+# dedupe_key 自动补 DEDUPE_FEISHU_PREFIX；返回 True = 第一次见到，可入队
 ```
 
+- `try_dedupe` 用单条 `SET NX EX`，并发安全；入队失败必须删除该键，否则消息永久丢失；
 - 阻塞读连接必须 `socket_timeout=None`（或 ≥ 2×block），与命令连接分开；
 - `MAXLEN ~` 近似裁剪；
 - 未 ACK 的条目留在 PEL，崩溃后 `XAUTOCLAIM`。
@@ -301,6 +307,14 @@ class Store:
 ```
 
 时间字段统一 `ISO8601` 字符串；`next_run_utc` 用 `now_utc_iso()` 格式（UTC、Z 结尾），比较用 `parse_iso`。
+
+```python
+# 模块级（M-STORE 交付）：cron 计算，纯标准库 zoneinfo
+def next_run_utc_after(cron: str, timezone_name: str, after: datetime | None = None) -> datetime
+# 返回严格晚于 after 的下一次触发时刻（UTC datetime）；after 默认 now(UTC)
+```
+
+**cron 语法限制（v1）**：仅标准 5 段数字语法（`*`、`a`、`a-b`、`*/n`、`a-b/n`、逗号列表），不支持 `JAN`、`L`、`W`；非法表达式抛 `ValueError`。
 
 ### 5.3 JSONL（`memory/jsonl.py`，M-STORE）
 
@@ -709,7 +723,7 @@ def supervisor_loop(settings, bus, store, stop_event)   # 1s 心跳/待处理；
 | `contracts.py` | M0 主线 | 标准库 | ✅ | `python -c "import contracts"` |
 | `config.py` | M0 主线 | pydantic-settings | ✅ | `python -c "from config import settings"` |
 | `bus/envelope.py` | M0 主线 | contracts | ✅ | `scripts/check_contracts.py` |
-| `bus/stream.py` | M0 主线 | redis, envelope | ❌ | `scripts/selfcheck.py` |
+| `bus/stream.py` | M0 主线（M-STORE 实现，已验收） | redis, envelope | ❌ | `scripts/check_store.py` |
 | `channel/base.py` | M0 主线 | contracts | ✅ | import |
 | `agents/context.py` | M0 主线 | contextvars | ✅ | import |
 | `agents/vision.py` | M0 主线 | 标准库（duck typing message） | ✅ | `scripts/check_contracts.py` |
@@ -819,7 +833,7 @@ requirements.txt
 |---|---|---|
 | 1 | `check_shell`：`pwsh` 探测、`echo`、`$LASTEXITCODE` 透传、中文输出、超时杀进程树、长输出落盘 | 全过 |
 | 2 | `check_fs`：写/读/改/删/Glob/Grep；图片返回 data URI 内容块；`../` 越界被拒 | 全过（M-FS 实测 56/56） |
-| 3 | `check_store`：建表、session 生命周期、schedule due、watch 去重、JSONL seq+fsync | 全过 |
+| 3 | `check_store`：建表、session 生命周期、schedule due、watch 去重、JSONL seq+fsync、Redis PEL 崩溃重放、PG checkpoint 往返 | 全过（M-STORE 交付，脚本 0 failure） |
 | 4 | `check_channel`：console 收发；飞书事件解析 fixture | 全过；真实飞书发送由 `FEISHU_LIVE=1` 门控 |
 | 5 | `check_router_tools`：ReplyUser 幂等（同 key 只发一次）、Schedule 创建/取消、Skill 清单 | 全过 |
 | 6 | `check_worker_tools`：SendMessage notify 立即返回；ask 超时文案；Web 失败结构化 | 全过 |
@@ -852,6 +866,10 @@ requirements.txt
 | 16 | 设计文档建议 `Grep(-n=True)`，但 `-n` 是非法 Python 标识符 | 参数名统一为 `n=True`，语义等价 `grep -n` |
 | 17 | `Glob` 契约写 `list[str]`，但空结果/截断需要提示 | 保持不变：提示以额外字符串项追加到列表末尾，不改成 dict |
 | 18 | 文本模型收到 image 块会 400 | 装配层 `VisionAdapterMiddleware` 按 `llm_supports_vision` 降级；工具层不判断模型能力 |
+| 19 | M-STORE 新增公开辅助函数 `try_dedupe` / `next_run_utc_after` | 接受：都是新增符号，不改既有签名；已写入 §4.3 / §5.2 |
+| 20 | cron 只支持标准 5 段数字语法 | 接受（v1 限制）：不支持 `JAN`/`L`/`W`；非法表达式抛 `ValueError` |
+| 21 | M-STORE 验收留下 Redis 空 stream + 组 `router`、PG schema `mstore_check` | 保留：生产 `public` 已核对未变；组可在 selfcheck 复用，`mstore_check` 不参与生产 |
+| 22 | `read_records` 按目录读取全部 `*.jsonl`（不按前缀过滤） | 接受：router 的 memory 目录只放 turns/inbox/tools 三类，读取方自行按字段过滤 |
 
 ---
 

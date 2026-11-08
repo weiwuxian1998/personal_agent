@@ -643,7 +643,7 @@ def compose_system_prompt(*parts: str) -> str
 
 1. `TraceMiddleware`（before_agent/before_model：把 `trace_id/task_id` 放进 contextvar 与 metadata）
 2. `ContextBudgetMiddleware`（before_model：注入 profile/summary/facts；按 256k soft / 320k hard 裁剪；只改本次请求，不改 state）
-3. `VisionAdapterMiddleware`（before_model：按 `settings.llm_supports_vision` 把 `image_url` 块降级为文本占位；只改本次请求，不改 state）
+3. `VisionAdapterMiddleware`（`wrap_model_call`：按 `settings.llm_supports_vision` 把 `image_url` 块降级为文本占位；只改本次请求，不改 state）
 4. `ToolPolicyMiddleware`（wrap_tool_call 最前：§12.3.1 R1–R8；命中拒绝/需确认）
 5. `ShellGuardMiddleware`（wrap_tool_call：错误指纹 3/4/6/12 熔断，仅 worker）
 6. `StopInjectionMiddleware`（worker：`stop_key` 存在时注入收尾指令一次，之后拒绝所有工具）
@@ -652,6 +652,11 @@ def compose_system_prompt(*parts: str) -> str
 9. `ErrorNormalizeMiddleware`（wrap_tool_call：把异常转成 `tool_error`，不让图崩）
 
 > 具体 hook 签名以 `langchain 1.4.9` 的 `AgentMiddleware` 源码为准；如与上面语义冲突，保持语义、调整参数并回报。
+>
+> **落地状态（2026-11-08）**：只实现了第 3 项 `VisionAdapterMiddleware`（router/worker 均已接入）；
+> 其余 8 项待批次 B/C。实现时按编号插入，不得改变已有序号。
+> 第 3 项实测：必须用 `wrap_model_call` + `request.override(messages=...)`；若用 `before_model`
+> 返回 messages 更新，会写进 checkpoint，换视觉模型后原图已丢失。
 
 ### 8.4 contextvar（主线定义，工具读取）
 
@@ -766,7 +771,7 @@ def supervisor_loop(settings, bus, store, stop_event)   # 1s 心跳/待处理；
 | `agents/context.py` | M0 主线 | contextvars | ✅ | import |
 | `agents/vision.py` | M0 主线 | 标准库（duck typing message） | ✅ | `scripts/check_contracts.py` |
 | `agents/base.py` | M0 主线 | langchain, config | ❌ | `scripts/check_agents.py` |
-| `agents/middleware.py` | M0 主线 | langchain, store | ❌ | 同上 |
+| `agents/middleware.py` | M0 主线 | langchain, agents.vision, store | ❌ | 同上 |
 | `agents/prompt.py` | M0 主线 | config | ❌ | 同上 |
 | `main_gateway.py` | M0 主线 | channel, bus, store | ❌ | `scripts/selfcheck.py` |
 | `main_router.py` | M0 主线 | agents.router, bus, store | ❌ | 端到端 |

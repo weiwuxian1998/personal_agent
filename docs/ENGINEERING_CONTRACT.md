@@ -405,14 +405,32 @@ def resolve_in_workspace(path: str | Path, root: Path) -> Path    # 越界抛 Va
 
 | 工具 | 入参 | 返回 |
 |---|---|---|
-| `Read` | `path, offset=0, limit=2000, as_="auto"` | 文本；图片返回内容块（v1 先返回 `{code:"image_not_supported"}`，真实图片通道留到实验后） |
+| `Read` | `path, offset=0, limit=2000, as_="auto"` | 文本：字符串；图片：内容块列表 `[{"type":"text","text":"[图片] <路径>\|mime\|字节"},{"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}]`（png/jpg/jpeg/gif/webp/bmp，≤4 MB；不缩放；`as_="text"` 时图片按二进制拒绝） |
 | `Write` | `path, content` | `{"ok":True,"bytes":n,"path":绝对路径}`，临时文件 + `os.replace` |
 | `Edit` | `path, old_string, new_string, replace_all=False` | `{"ok":True,"replacements":n}`；`old_string` 不唯一 → `error_class="not_unique"` |
 | `DeleteFile` | `paths: list[str]` | `{"deleted":[...],"failed":[{"path","reason"}]}` |
-| `Glob` | `pattern, path=None, limit=200` | `list[str]`（按 mtime 新→旧；排除 `.git/node_modules/.venv/__pycache__`） |
-| `Grep` | `pattern, path=None, glob=None, -n=True, limit=200` | `"文件:行号: 内容"` 多行字符串；跳过二进制与 >2MB |
+| `Glob` | `pattern, path=None, limit=200` | `list[str]`（按 mtime 新→旧；排除 `.git/node_modules/.venv/__pycache__`）；空结果返回 `["[no matches] ..."]`；截断时在**列表末尾追加**一条 `"[已截断] ..."` 字符串项 |
+| `Grep` | `pattern, path=None, glob=None, n=True, limit=200` | `"文件:行号: 内容"` 多行字符串；跳过二进制与 >2MB；参数名是 `n`（`-n` 不是合法 Python 标识符），语义等价 `grep -n`；空结果/截断同样以文本提示行追加 |
 
 **不新增** `ListDir` / `SearchFiles` 等同义工具。
+
+#### 7.3.1 图片与模型能力（**装配层职责，工具层不判断**）
+
+- `Read` **始终**返回多模态内容块，不查询模型能力、不猜测调用方；
+- 由装配层 middleware `VisionAdapterMiddleware` 在每次模型调用前决定：
+  - `settings.llm_supports_vision=True` → 原样保留 `image_url` 块；
+  - `False` → 把 `image_url` 块替换为等量的 `{"type":"text","text":"[图片已省略：当前模型不支持视觉，原图在工作区 <路径>]"}`，文本块保留；
+- 转换只作用于**本次模型请求**，不改 checkpoint 里的 state；后续换成视觉模型仍能读到历史图片；
+- 工具层禁止为了让文本模型不报 400 而提前丢弃图片；文本模型收到 image 块的 400 由装配层兜住。
+
+```python
+# config.py（冻结）
+llm_supports_vision: bool = False          # deepseek-flash v1 为文本模型
+
+# agents/vision.py（主线）
+def adapt_content(content, *, supports_vision: bool, placeholder: str = ...) -> Any
+def adapt_messages(messages, *, supports_vision: bool, placeholder: str = ...) -> list
+```
 
 ### 7.4 Router 工具
 
@@ -590,12 +608,13 @@ def compose_system_prompt(*parts: str) -> str
 
 1. `TraceMiddleware`（before_agent/before_model：把 `trace_id/task_id` 放进 contextvar 与 metadata）
 2. `ContextBudgetMiddleware`（before_model：注入 profile/summary/facts；按 256k soft / 320k hard 裁剪；只改本次请求，不改 state）
-3. `ToolPolicyMiddleware`（wrap_tool_call 最前：§12.3.1 R1–R8；命中拒绝/需确认）
-4. `ShellGuardMiddleware`（wrap_tool_call：错误指纹 3/4/6/12 熔断，仅 worker）
-5. `StopInjectionMiddleware`（worker：`stop_key` 存在时注入收尾指令一次，之后拒绝所有工具）
-6. `WorkerInboxMiddleware`（worker：before_model 非阻塞读 `asst:stream:worker:<task>`，把 `router_message` 追成 `HumanMessage`）
-7. `CostMiddleware`（after_model：记 usage → `cost_ledger`）
-8. `ErrorNormalizeMiddleware`（wrap_tool_call：把异常转成 `tool_error`，不让图崩）
+3. `VisionAdapterMiddleware`（before_model：按 `settings.llm_supports_vision` 把 `image_url` 块降级为文本占位；只改本次请求，不改 state）
+4. `ToolPolicyMiddleware`（wrap_tool_call 最前：§12.3.1 R1–R8；命中拒绝/需确认）
+5. `ShellGuardMiddleware`（wrap_tool_call：错误指纹 3/4/6/12 熔断，仅 worker）
+6. `StopInjectionMiddleware`（worker：`stop_key` 存在时注入收尾指令一次，之后拒绝所有工具）
+7. `WorkerInboxMiddleware`（worker：before_model 非阻塞读 `asst:stream:worker:<task>`，把 `router_message` 追成 `HumanMessage`）
+8. `CostMiddleware`（after_model：记 usage → `cost_ledger`）
+9. `ErrorNormalizeMiddleware`（wrap_tool_call：把异常转成 `tool_error`，不让图崩）
 
 > 具体 hook 签名以 `langchain 1.4.9` 的 `AgentMiddleware` 源码为准；如与上面语义冲突，保持语义、调整参数并回报。
 
@@ -693,6 +712,7 @@ def supervisor_loop(settings, bus, store, stop_event)   # 1s 心跳/待处理；
 | `bus/stream.py` | M0 主线 | redis, envelope | ❌ | `scripts/selfcheck.py` |
 | `channel/base.py` | M0 主线 | contracts | ✅ | import |
 | `agents/context.py` | M0 主线 | contextvars | ✅ | import |
+| `agents/vision.py` | M0 主线 | 标准库（duck typing message） | ✅ | `scripts/check_contracts.py` |
 | `agents/base.py` | M0 主线 | langchain, config | ❌ | `scripts/check_agents.py` |
 | `agents/middleware.py` | M0 主线 | langchain, store | ❌ | 同上 |
 | `agents/prompt.py` | M0 主线 | config | ❌ | 同上 |
@@ -743,6 +763,7 @@ config.py
 bus/envelope.py
 channel/base.py
 agents/context.py
+agents/vision.py
 docs/ENGINEERING_CONTRACT.md
 requirements.txt
 .env.example
@@ -797,14 +818,15 @@ requirements.txt
 | # | 用例 | 期望 |
 |---|---|---|
 | 1 | `check_shell`：`pwsh` 探测、`echo`、`$LASTEXITCODE` 透传、中文输出、超时杀进程树、长输出落盘 | 全过 |
-| 2 | `check_fs`：写/读/改/删/Glob/Grep；`../` 越界被拒 | 全过 |
+| 2 | `check_fs`：写/读/改/删/Glob/Grep；图片返回 data URI 内容块；`../` 越界被拒 | 全过（M-FS 实测 56/56） |
 | 3 | `check_store`：建表、session 生命周期、schedule due、watch 去重、JSONL seq+fsync | 全过 |
 | 4 | `check_channel`：console 收发；飞书事件解析 fixture | 全过；真实飞书发送由 `FEISHU_LIVE=1` 门控 |
 | 5 | `check_router_tools`：ReplyUser 幂等（同 key 只发一次）、Schedule 创建/取消、Skill 清单 | 全过 |
 | 6 | `check_worker_tools`：SendMessage notify 立即返回；ask 超时文案；Web 失败结构化 | 全过 |
 | 7 | `check_memory`：预算裁剪保留最后 HumanMessage、tool 成对；折叠切点安全 | 全过 |
 | 8 | `scripts/selfcheck.py`：Redis group、PG checkpoint 读写、SQLite 表、工具路径守卫 | 退出码 0 |
-| 9 | 端到端：手机发"你好" → router 回 ReplyUser；派"看下 workspace 有什么" → worker_result → router 再回一次 | 手机实收两条 |
+| 9 | `scripts/check_contracts.py`：`adapt_messages` 在 `llm_supports_vision=False` 时把 image 块换成文本、文本块保留；`True` 时原样返回 | 全过 |
+| 10 | 端到端：手机发"你好" → router 回 ReplyUser；派"看下 workspace 有什么" → worker_result → router 再回一次 | 手机实收两条 |
 
 ---
 
@@ -826,6 +848,10 @@ requirements.txt
 | 12 | `langchain` 版本文档未定 | 实测 `langchain 1.4.9` + core 1.7.6 可 `from langchain.agents import create_agent`，锁定该版本 |
 | 13 | 当前 env 缺 `langchain` | 已补装（1.4.9）；`requirements.txt` 已锁 |
 | 14 | worker 巡检的 `beat_at` 取自 `checkpoints.created_at` | 表由 `PostgresSaver.setup()` 建；只读 `MAX(created_at)`，失败只记日志不阻断 |
+| 15 | 设计文档 §7.3 写 `Read` 图片返回 `image_not_supported`；用户明确要求 `Read` 支持读图 | **以用户要求为准**：工具返回 `image_url` data URI 内容块（M-FS 实现，验收 56/56）；不把实现改回去 |
+| 16 | 设计文档建议 `Grep(-n=True)`，但 `-n` 是非法 Python 标识符 | 参数名统一为 `n=True`，语义等价 `grep -n` |
+| 17 | `Glob` 契约写 `list[str]`，但空结果/截断需要提示 | 保持不变：提示以额外字符串项追加到列表末尾，不改成 dict |
+| 18 | 文本模型收到 image 块会 400 | 装配层 `VisionAdapterMiddleware` 按 `llm_supports_vision` 降级；工具层不判断模型能力 |
 
 ---
 

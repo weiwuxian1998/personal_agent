@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from agents.vision import adapt_content, adapt_messages  # noqa: E402
 from bus.envelope import event_from_redis, event_to_redis, new_event, render_digest  # noqa: E402
 from contracts import Event, IncomingMessage, SendResult, TaskSpec, parse_iso, ulid  # noqa: E402
 
@@ -61,6 +62,28 @@ def main() -> int:
                          text="hi", create_time=0)
     check("incoming_message", im.text == "hi")
     check("send_result", SendResult(ok=True, message_id="om_2").ok)
+
+    blocks = [
+        {"type": "text", "text": "[图片] C:/w/a.png"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+    ]
+    check("vision_true_keeps_blocks", adapt_content(blocks, supports_vision=True) == blocks)
+    degraded = adapt_content(blocks, supports_vision=False)
+    check("vision_false_removes_image", all(b.get("type") != "image_url" for b in degraded))
+    check("vision_false_keeps_text", degraded[0] == blocks[0])
+    check("vision_false_adds_placeholder", "不支持视觉" in degraded[1]["text"])
+
+    class _Msg:
+        def __init__(self, content):
+            self.content = content
+
+        def model_copy(self, update):
+            return _Msg(update.get("content", self.content))
+
+    original = [_Msg(blocks)]
+    adapted = adapt_messages(original, supports_vision=False)
+    check("adapt_messages_no_mutation", original[0].content == blocks)
+    check("adapt_messages_new_content", "image_url" not in [b.get("type") for b in adapted[0].content])
 
     print(f"\n{len(failures)} failure(s)")
     return 1 if failures else 0

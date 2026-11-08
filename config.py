@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     # 文档 §10.2 的风险：思考模式 + 工具调用需要回传 reasoning_content。
     # v1 先关闭思考作为确定性取舍；真 key 验证后再打开（记录在契约 §14）。
     llm_thinking_disabled: bool = True
+    # 当前模型是否支持 image_url 内容块；False 时由装配层 VisionAdapter 降级为文本。
+    # deepseek-flash 为文本模型，v1 默认 False。
+    llm_supports_vision: bool = False
 
     # ---------- 运行目录（与代码分离，文档 §2.3） ----------
     data_dir: Path = Path.home() / ".assistant"

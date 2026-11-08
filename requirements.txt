@@ -1,0 +1,28 @@
+# 本机实测可用的组合（Windows 11 + conda env `feishu`，Python 3.11.18）
+# 安装：pip install -r requirements.txt
+# 注意：不要升级到未验证的大版本；版本变更需走契约变更流程。
+
+# Agent 装配（create_agent + middleware）
+langchain==1.4.9
+langchain-core==1.7.6
+
+# LangGraph 运行时 + Postgres checkpointer
+langgraph==1.2.20
+langgraph-checkpoint-postgres==3.2.0
+
+# psycopg3：checkpointer 驱动；binary 版免编译
+psycopg[binary]==3.3.8
+psycopg-pool==3.3.3
+
+# Redis（Stream / 去重 / 幂等 / 锁）
+redis==8.1.0
+
+# 飞书官方 SDK（长连接 + OpenAPI）
+lark-oapi==1.7.5
+
+# 配置管理
+pydantic-settings==2.12.0
+
+# OpenAI 兼容 LLM（DeepSeek）
+langchain-openai==1.7.4
+httpx==0.28.1

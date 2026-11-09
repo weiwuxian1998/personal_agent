@@ -60,9 +60,8 @@ class Settings(BaseSettings):
     # 未配置时 WebSearch/WebFetch 返回结构化 not_configured，不做任何降级。
     deepseek_search_api_key: str = ""
     search_api_base_url: str = "https://api.deepseek.com"
-    # need_content 默认值：false 只返回 snippet/summary，正文按需开启（省时省钱）
-    web_search_need_content: bool = False
-    web_search_default_count: int = 5
+    # count / need_content 的默认值由 `WebSearch` 签名钉死（5 / False），
+    # 这里**不再**保留同义字段，避免出现两套默认值（契约 §7.7）。
     web_search_timeout_s: float = 30.0
 
     # ---------- 运行目录（与代码分离，文档 §2.3） ----------

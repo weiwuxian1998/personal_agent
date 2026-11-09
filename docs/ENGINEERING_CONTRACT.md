@@ -569,16 +569,12 @@ def build_send_message_tool(*, redis_client, task_id: str, trace_id: str,
 - 预算：每 task ≤20 次、每分钟 ≤6 次（Redis `retry_key` 同款计数或独立 hash 均可），超限返回 `{"ok":False,"error_class":"ask_budget_exhausted"}`；
 - 只能发 router，**没有 `to` 参数**。
 
-#### `tools/web.py`（B2）
+#### `tools/web.py`（批次 C）
 
-```python
-def build_web_tools(*, api_key: str, base_url: str = "https://api.deepseek.com",
-                    tool_outputs_dir: Path, timeout_s: float = 30) -> list[BaseTool]  # [WebSearch, WebFetch]
-```
-
-- `WebSearch(query, count=5, site=None, need_content=False)` → `POST /v1/tools/search`，返回 `[{title,url,snippet,summary,date,authority}]`；
-- `WebFetch(url, max_chars=20000)` → `POST /v1/tools/fetch`，返回 `{"title","content","truncated"}`；
-- 两个端点失败返回 `error_class ∈ {http_error, network, quota}`；长内容按 §7.2 的同一套 stub 规则落盘（复用 `tools/shell.py` 导出的 `stub_text()`）。
+**签名与返回结构一律以 §7.7 为准**（`build_web_tools(*, settings, tool_outputs_dir)`），
+错误分类同样只看 §7.7 的 11 类表。本节只保留模块位置说明，历史上的
+`build_web_tools(api_key=...)` 签名与 `{http_error, network, quota}` 三类已删除——
+把 `api_key` 作为入参会让装配层有机会误传 `LLM_API_KEY`，与 §7.7 的凭证隔离冲突。
 
 #### `tools/todo.py`（B2）
 
@@ -617,9 +613,13 @@ WebFetch(url: str) -> dict
 
 - `query`：1–128 字符，支持 `site:` / `-site:` / `-词` / `"短语"` / `lang:` / `after:` / `before:`；
   不做二次改写、不加隐式引号；
-- `count`：1–50，默认取 `settings.web_search_default_count`（5）；越界按边界截断并在返回里注明；
-- `need_content`：默认 `settings.web_search_need_content`（`False`）。默认关闭的理由是实测：`need_content=true`
-  时单条 `content` 可达 4.5k 字符，5 条就接近 15k 字符，容易顶爆上下文；需要正文时优先用 `WebFetch`；
+- `count`：1–50，**默认值由签名钉死为 `5`**（不改读 config）。理由：`@tool` 的 schema 默认值在装饰时
+  固化，函数内无法区分"未传"与"显式传 5"；要让 config 生效只能改成 `None` 哨兵，与冻结签名冲突。
+  `config.web_search_default_count` 已删除，避免出现两套默认值；
+- `need_content`：**默认值由签名钉死为 `False`**（同上）。默认关闭的理由：实测单条 `content`
+  可达 4.5k–13k 字符，5 条会顶爆上下文。**但若已确定要读正文，优先用 `WebSearch(need_content=true)`
+  一次性拿到多条正文，不要 search 完再逐条 `WebFetch`**——两者返回的正文高度重叠，分开调用会付两次费；
+  `WebFetch` 只用于"已知具体 URL"或需要该页完整正文的场景（详见下方 Prompt 指引）；
 - `url`：必须带 host 的 `http/https`，≤8192 字符，拒绝含账号密码的 URL（发送前校验，返回 `invalid_args`）。
 
 #### 请求
@@ -637,20 +637,27 @@ POST {search_api_base_url}/v1/tools/fetch
 #### 返回结构（实测字段，2026-11-09）
 
 ```jsonc
-// WebSearch
+// WebSearch（truncated / artifact 为向后兼容增字段，二者成对出现）
 {"ok": true, "query": "...", "count": 5, "results": [
   {"title": str, "url": str, "snippet": str, "summary": str,
    "content": str,          // need_content=false 时为 ""（长度 0），true 时为 Markdown 正文
    "site_name": str, "site_icon": str, "authority": int,
-   "rerank_score": float, "date": "2025-10-08T16:00:00+00:00"}
+   "rerank_score": float, "date": "2025-10-08T16:00:00+00:00",
+   "truncated": bool,       // 可选：该条 content 已落盘并替换为 stub 时为 true
+   "artifact": str}         // 可选：落盘绝对路径，与 truncated 成对
 ]}
 
-// WebFetch
-{"ok": true, "url": "...", "title": str, "content": str}   // content 为 Markdown
+// WebFetch（truncated 恒存在，artifact 仅 truncated=true 时存在）
+{"ok": true, "url": "...", "title": str, "content": str, "truncated": bool, "artifact": str}
 ```
 
-- `summary` 在 `need_content=false` 时**也有值**（实测 138–669 字符），不要把它当 `content` 的别名；
-- `content` 为 `""` 表示未请求正文，不是抓取失败。
+- `summary` 在 `need_content=false` 时**也有值**：多次实测 **1988–2870 字符**（2026-11-09，同一 query 多轮取样，
+  历史记录里的 138–669 已被推翻），是**波动值不是常量**——不要把它当定长字段、
+  不要拿它估算 token 预算，也不要把它当 `content` 的别名；
+- `content` 为 `""` 表示未请求正文，不是抓取失败；
+- `truncated` / `artifact` 是 §7.7 相对早期草案的**新增字段**（后向兼容）：只有 content 超过
+  `tool_output_max_lines` / `tool_output_max_bytes` 时才出现。实测 13081 字符仍未触发（默认 64 KiB），
+  所以正常搜索结果不会落盘。
 
 #### 错误映射（与 `tools/errors.py` 的 8 类一致，新增第 9 类 `not_configured`）
 
@@ -675,12 +682,30 @@ POST {search_api_base_url}/v1/tools/fetch
 
 #### 落盘 stub 规则
 
-- `WebFetch.content` 与 `WebSearch` 单条 `content` 超过 `tools/paths.py` 的公共阈值时，
-  写入 `tool_outputs/<trace_id>/<tool_call_id>-<n>.md`，返回值里替换为
-  **与 Shell/Read 完全相同的 stub 文本**（复用 `tools/paths.py` 的格式化函数，
-  禁止另写一套）。`title` / `url` / `snippet` 永不落盘（体积小且是定位信息）。
-- 实测 `content` 典型长度：search `0`（false）/ `1.1k–4.5k`（true）；fetch `0.2k–2.2k`。
-  阈值建议沿用现有公共默认值（先不改），等出现 >8k 的真实样本再评估。
+- `WebFetch.content` 与 `WebSearch` 单条 `content` 超过公共阈值（`settings.tool_output_max_lines` /
+  `settings.tool_output_max_bytes`）时，写入 `tool_outputs/<trace_id>/<tool_call_id>-<n>.md`，
+  返回值里替换为**与 Shell/Read 完全相同的 stub 文本**。
+  阈值的判定与格式化函数都在 **`tools/shell.py`**（`needs_artifact()` / `stub_text()`），
+  `tools/paths.py` 只做路径守卫、没有任何格式化函数——Web 工具直接
+  `from tools.shell import needs_artifact, stub_text`，禁止另写一套 stub。
+  `scripts/check_web.py` 断言 `web.stub_text is tools.shell.stub_text`（同一个函数对象）。
+  `title` / `url` / `snippet` 永不落盘（体积小且是定位信息）。
+- 实测 `content` 长度（2026-11-09，多轮取样）：search `need_content=false` 恒为 `0`；
+  search `true` 为 **2994–15228** 字符；fetch 为 **13081** 字符（同一个页面，与 search 那条完全一致）。
+  即单条正文可以上万字符，但距默认 64 KiB 阈值仍远，**实测未触发 artifact**。
+  阈值先沿用公共默认值不变，等出现 >64 KiB 的真实样本再评估。
+
+#### Prompt 指引（必须写进工具 description，模型据此选路）
+
+`search(need_content=true)` 与 `fetch` 返回的正文**高度重叠**（实测同一页面两边都是 13081 字符）。
+因此工具说明里必须明确：
+
+- 已知「要查什么」→ `WebSearch(need_content=true)`，一次拿多条正文，**不要再逐条 `WebFetch`**；
+- 已有具体 URL / 只缺该页完整正文 → `WebFetch`；
+- 已用 `need_content=false` 看过 `summary` 再决定深读时，直接对命中 URL 调 `WebFetch`，
+  不要再对同一 query 重跑一次 `need_content=true` 的搜索。
+
+反例（禁止）：先 `WebSearch` 拿 URL，再对每条结果 `WebFetch`——同一批正文付两次费。
 
 #### 凭证隔离（硬约束）
 
@@ -751,13 +776,17 @@ def compose_system_prompt(*parts: str) -> str
 7. `WorkerInboxMiddleware`（worker：before_model 非阻塞读 `asst:stream:worker:<task>`，把 `router_message` 追成 `HumanMessage`）
 8. `CostMiddleware`（after_model：记 usage → `cost_ledger`）
 9. `ErrorNormalizeMiddleware`（wrap_tool_call：把异常转成 `tool_error`，不让图崩）
+10. `ToolContextMiddleware`（wrap_tool_call：把 `tool_call["id"]` 写进 `current_tool_call_id`，
+    调用结束 `reset` 恢复；供 `tools/web.py` / `tools/shell.py` 落盘命名使用）
 
 > 具体 hook 签名以 `langchain 1.4.9` 的 `AgentMiddleware` 源码为准；如与上面语义冲突，保持语义、调整参数并回报。
 >
-> **落地状态（2026-11-08）**：只实现了第 3 项 `VisionAdapterMiddleware`（router/worker 均已接入）；
-> 其余 8 项待批次 B/C。实现时按编号插入，不得改变已有序号。
+> **落地状态（2026-11-09）**：已实现第 3 项 `VisionAdapterMiddleware` 与第 10 项 `ToolContextMiddleware`
+> （router/worker 均已接入）；其余 7 项待批次 B/C。实现时按编号插入，不得改变已有序号。
 > 第 3 项实测：必须用 `wrap_model_call` + `request.override(messages=...)`；若用 `before_model`
 > 返回 messages 更新，会写进 checkpoint，换视觉模型后原图已丢失。
+> 第 10 项是**落盘可关联的前提**：没有它，`current_tool_call_id` 为空，artifact 会落到
+> `notrace/` 且文件名是随机 ULID（`check_web.py` 手工 set 过，所以单测发现不了）。
 
 ### 8.4 contextvar（主线定义，工具读取）
 
@@ -987,7 +1016,7 @@ requirements.txt
 | 6 | `check_worker_tools`：SendMessage notify 立即返回；ask 超时文案；Web 失败结构化 | 全过 |
 | 7 | `check_memory`：预算裁剪保留最后 HumanMessage、tool 成对；折叠切点安全 | 全过 |
 | 8 | `scripts/selfcheck.py`：Redis group、PG checkpoint 读写、SQLite 表、工具路径守卫 | 退出码 0 |
-| 9 | `scripts/check_contracts.py`：契约核心（33 项）；含 Vision 中间件 checkpoint 保留原图、`Bus.lag` 的 ACK 后归零与 `lag=None` 兜底、Thread 私有属性不遮蔽、lark 惰性导入（子进程） | 全过（2026-11-09：33 通过 / 0 失败） |
+| 9 | `scripts/check_contracts.py`：契约核心（35 项）；含 Vision 中间件 checkpoint 保留原图、`Bus.lag` 的 ACK 后归零与 `lag=None` 兜底、Thread 私有属性不遮蔽、lark 惰性导入（子进程）、artifact 路径含真实 `tool_call_id` | 全过（2026-11-09：35 通过 / 0 失败） |
 | 10 | 端到端：手机发"你好" → router 回 ReplyUser；派"看下 workspace 有什么" → worker_result → router 再回一次 | ✅ console 模式已跑通（2026-11-09，见下方实测记录）；真机飞书发送仍需用户确认 |
 
 **端到端实测记录（2026-11-09，console 模式，真实模型）**
@@ -1055,6 +1084,12 @@ requirements.txt
 | 37 | `tools/__init__.py`、`channel/factory.py`、`main_*.py` 不在原归属表 | 归 M0 主线（已在 §10 补齐）；批次 C 的 `tools/web.py` + `check_web.py` 单独归属 |
 | 38 | 该 LLM 端点不校验未知 `extra_body` 字段（塞 `this_field_does_not_exist` 仍 200），因此无法用"请求成功"证明 `thinking.disabled` 被实现 | 结论：`LLM_THINKING_DISABLED=true` 在当前端点**不报错但无法证明生效**；开启思考模式的两轮对话也未出现 400。保留默认 `true`（确定性），待有 `reasoning_content` 可观测时再验证 |
 | 39 | 修复类改动缺少自动回归断言 | 四条摩擦各有断言，见 §13-9：`channel_factory_lazy_lark_subprocess`、`heartbeat_join_ok` + `thread_no_stdlib_shadow:*`、`lag_after_ack_zero_not_xlen` + `lag_none_fallback_positive`、`vision_checkpoint_keeps_image` + `vision_request_downgraded` |
+| 40 | §7.5 与 §7.7 并存两套 `build_web_tools` 签名、两套错误类（`{http_error, network, quota}` vs 11 类表） | **以 §7.7 为准**：§7.5 只保留模块位置说明，删除 `build_web_tools(api_key=...)` 与三类旧错误；`api_key` 作入参会让装配层误传 LLM key，与凭证隔离冲突 |
+| 41 | §7.7 签名写死 `count=5 / need_content=False`，正文又说"默认取 settings" | 二选一取**签名默认值即契约**；`config.py` 删除 `web_search_default_count` / `web_search_need_content`，杜绝两套默认值。要改默认值须走变更流程改签名（`None` 哨兵） |
+| 42 | §7.7 写"复用 `tools/paths.py` 的格式化函数"，实际在 `tools/shell.py` | 文档改指向 `tools/shell.py` 的 `needs_artifact()` / `stub_text()`；`check_web.py` 断言 `web.stub_text is tools.shell.stub_text` |
+| 43 | §7.7 要求落盘到 `tool_outputs/<trace_id>/<tool_call_id>-<n>.md`，但仓库里**无人给 `current_tool_call_id` 赋值**（`check_web.py` 手工 set，掩盖了缺口） | 新增 §8.3-10 `ToolContextMiddleware`（`wrap_tool_call` set/reset），router/worker 均已接入；断言 `tool_artifact_path_uses_tool_call_id`（真实 graph + 真实 `tools/web.py`，只桩 HTTP），反证 `tool_artifact_path_without_middleware_loses_id` |
+| 44 | §7.7 返回体未写 `truncated` / `artifact` | 记为**向后兼容增字段**（成对出现，仅 content 落盘时出现）；已补进 §7.7 返回结构 |
+| 45 | `search(need_content=true)` 与 `fetch` 返回正文高度重叠（实测同一页面均 13081 字符），模型容易先 search 再逐条 fetch | 工具 description 与 §7.7「Prompt 指引」都明确：优先 `WebSearch(need_content=true)`，`WebFetch` 只用于已知 URL；避免同一批正文付两次费 |
 
 ---
 

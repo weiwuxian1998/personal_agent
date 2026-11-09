@@ -223,6 +223,93 @@ def main() -> int:
     sent_types = [b.get("type") for m in received[0] for b in (m.content if isinstance(m.content, list) else [])]
     check("vision_request_downgraded", "image_url" not in sent_types, f"sent_blocks={sent_types}")
 
+    # ------------------------------------------------ ToolContextMiddleware：落盘路径带真实 tool_call_id
+    # §7.7 要求落盘到 `tool_outputs/<trace_id>/<tool_call_id>-<n>.md`。若装配层不赋值，
+    # `current_tool_call_id` 为空 → 文件名退化为随机 ULID、目录退化为 `notrace/`，
+    # trace 与落盘文件无法关联。这里用**真实 graph + 真实 tools/web.py**跑一遍，
+    # 只把 HTTP 层换成大正文桩（不联网），断言文件名里确实是模型给出的 tool_call id。
+    import tempfile  # noqa: E402
+
+    import tools.web as web_mod  # noqa: E402
+    from agents.context import current_trace_id  # noqa: E402
+    from agents.middleware import ToolContextMiddleware  # noqa: E402
+    from tools.web import build_web_tools  # noqa: E402
+
+    REAL_CALL_ID = "call-real-001"
+    BIG_CONTENT = "x" * 100_000  # > tool_output_max_bytes(64 KiB)，强制落盘
+
+    def _run_fetch_graph(*, middleware: list, outputs_dir: Path) -> list[str]:
+        calls = {"n": 0}
+
+        class _ToolCallModel(BaseChatModel):
+            @property
+            def _llm_type(self) -> str:
+                return "toolcall"
+
+            def bind_tools(self, tools, **kwargs):
+                return self
+
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    msg = AIMessage(
+                        content="",
+                        tool_calls=[{
+                            "name": "WebFetch",
+                            "args": {"url": "https://m.example/x"},
+                            "id": REAL_CALL_ID,
+                            "type": "tool_call",
+                        }],
+                    )
+                else:
+                    msg = AIMessage(content="ok")
+                return ChatResult(generations=[ChatGeneration(message=msg)])
+
+        tools = build_web_tools(settings=settings, tool_outputs_dir=outputs_dir)
+        g = create_agent(
+            model=_ToolCallModel(), tools=tools, system_prompt="s",
+            middleware=middleware, checkpointer=InMemorySaver(), name="toolctx",
+        )
+        # trace_id 在真实链路里由 router/worker 进程设置；这里手工置位，
+        # 断言重点在 tool_call_id 是否被装配层赋值。
+        current_trace_id.set("tr-assert")
+        g.invoke(
+            {"messages": [HumanMessage(content="抓取")]},
+            {"configurable": {"thread_id": "toolctx"}},
+        )
+        return sorted(str(p.relative_to(outputs_dir)) for p in Path(outputs_dir).rglob("*.md"))
+
+    _orig_call_json = web_mod._call_json
+    _orig_search_key = settings.deepseek_search_api_key
+    web_mod._call_json = lambda *a, **k: {"ok": True, "data": {"title": "T", "content": BIG_CONTENT}}
+    settings.deepseek_search_api_key = "sk-unit-test-not-a-real-key"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            on = _run_fetch_graph(
+                middleware=[VisionAdapterMiddleware(settings), ToolContextMiddleware()],
+                outputs_dir=Path(td),
+            )
+            check(
+                "tool_artifact_path_uses_tool_call_id",
+                len(on) == 1
+                and REAL_CALL_ID in Path(on[0]).name
+                and Path(on[0]).parent.name == "tr-assert",
+                f"files={on}",
+            )
+        with tempfile.TemporaryDirectory() as td:
+            off = _run_fetch_graph(
+                middleware=[VisionAdapterMiddleware(settings)],  # 故意不装 ToolContext
+                outputs_dir=Path(td),
+            )
+            check(
+                "tool_artifact_path_without_middleware_loses_id",
+                len(off) == 1 and REAL_CALL_ID not in Path(off[0]).name,
+                f"files={off}",
+            )
+    finally:
+        web_mod._call_json = _orig_call_json
+        settings.deepseek_search_api_key = _orig_search_key
+
     print(f"\n{len(failures)} failure(s)")
     return 1 if failures else 0
 

@@ -400,9 +400,9 @@ def build_web_tools(*, settings: Settings, tool_outputs_dir: Path) -> list[BaseT
     base_url = base_url.rstrip("/") or _DEFAULT_BASE_URL
     api_key = (getattr(settings, "deepseek_search_api_key", "") or "").strip()
     timeout_s = float(getattr(settings, "web_search_timeout_s", 30.0) or 30.0)
-    # 契约 §7.7 的签名把默认值钉成 count=5 / need_content=False；config.py 的
-    # web_search_default_count / web_search_need_content 当前也是 5 / False，
-    # 两者一致。若未来改 config 默认值，须走契约变更流程同步改签名。
+    # 契约 §7.7：签名默认值（count=5 / need_content=False）就是契约本身；
+    # config.py 里不再保留同义字段，避免出现两套默认值。要改默认值须走契约变更流程，
+    # 把签名改成 None 哨兵并同步文档。
 
     max_lines = _as_int(getattr(settings, "tool_output_max_lines", 2000)) or 2000
     max_bytes = _as_int(getattr(settings, "tool_output_max_bytes", 64 * 1024)) or 64 * 1024
@@ -429,11 +429,16 @@ def build_web_tools(*, settings: Settings, tool_outputs_dir: Path) -> list[BaseT
         入参：
         - query: 搜索词，1–128 字符；支持 site: / -site: / -词 / "短语" / lang: / after: / before:；
           不做二次改写、不加隐式引号
-        - count: 返回条数 1–50（默认 5，与 settings.web_search_default_count 一致）；
+        - count: 返回条数 1–50（默认 5，由签名固定）；
           越界按边界截断，并在返回的 count_note 里注明
-        - need_content: 是否要正文（默认 false，与 settings.web_search_need_content 一致）。
-          false 时单条 content 为 ""，但 summary 有值（138–669 字符，可当摘要用）；
-          true 时单条 content 可达 4.5k 字符，容易顶爆上下文，需要正文时优先用 WebFetch
+        - need_content: 是否要正文（默认 false，由签名固定）。
+          false 时单条 content 为 ""，但 summary 仍有值（实测 1988–2870 字符，波动，可当摘要）；
+          true 时单条 content 可达 1.5 万字符，多条会顶爆上下文
+
+        选路（务必遵守，否则会重复付费）：
+        - 已经知道要查什么 → 直接用 `need_content=true` 一次拿多条正文，
+          **不要** search 完再对每条结果调 WebFetch（两者正文高度重叠，同一批内容付两次费）；
+        - 只有已知具体 URL、或只缺该页完整正文时才用 WebFetch。
 
         返回：
         {"ok": true, "query", "count", "need_content", "results": [
@@ -519,6 +524,10 @@ def build_web_tools(*, settings: Settings, tool_outputs_dir: Path) -> list[BaseT
 
         入参：
         - url: 必须带 host 的 http/https，≤8192 字符；含账号密码的 URL 直接拒绝（不发请求）
+
+        选路：本工具只用于「已有具体 URL」或「只缺该页完整正文」。
+        若还在「要查什么」的阶段，用 WebSearch(need_content=true) 一次拿多条正文，
+        **不要** search 完再逐条 WebFetch——返回正文高度重叠，会重复付费。
 
         返回：
         {"ok": true, "url", "title", "content", "truncated"}

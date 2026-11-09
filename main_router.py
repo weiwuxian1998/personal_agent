@@ -113,6 +113,18 @@ def _apply_worker_results(store: Store, events: list[Event]) -> None:
             logger.warning("更新会话状态失败 session=%s", session_id, exc_info=True)
 
 
+def _tool_call_names(messages: list[Any]) -> list[str]:
+    """按顺序取出本批消息里所有工具调用的名字（用于日志与 turns 记账）。"""
+    names: list[str] = []
+    for message in messages:
+        for call in getattr(message, "tool_calls", None) or []:
+            if isinstance(call, dict):
+                names.append(str(call.get("name") or "?"))
+            else:
+                names.append(str(getattr(call, "name", "?")))
+    return names
+
+
 def _process_batch(
     *,
     batch: list[tuple[str, Event]],
@@ -160,6 +172,17 @@ def _process_batch(
         },
     )
     reply = last_ai_text(result.get("messages") or [])
+    messages = result.get("messages") or []
+    tool_names = _tool_call_names(messages)
+    logger.info(
+        "模型产出：消息 %d 条，工具调用 %d 次 %s；回复 %d 字",
+        len(messages),
+        len(tool_names),
+        tool_names or "[]",
+        len(reply),
+    )
+    if reply:
+        logger.info("模型回复原文：%s", reply[:800])
 
     turns.append(
         {
@@ -168,6 +191,7 @@ def _process_batch(
             "event_ids": [e.id for e in events],
             "digest": digest,
             "reply": reply,
+            "tool_calls": tool_names,
             "ok": True,
         }
     )

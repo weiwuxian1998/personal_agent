@@ -601,6 +601,107 @@ def safe_cut_index(messages, keep_last: int) -> int
 
 `StopCommand(command_id)` 只停止**本进程内由 Shell 启动的后台命令**；需要 `tools/shell.py` 暴露 `register_background_command` / `stop_background_command`。若 v1 未实现后台命令，工具返回 `{"ok":False,"error_class":"not_supported","hint":"v1 只支持同步 Shell"}`，不得伪造成功。
 
+### 7.7 Web 工具：`WebSearch` / `WebFetch`（批次 C，接口已实测）
+
+归属：`tools/web.py`（新建）+ `scripts/check_web.py`。**不要复用 OpenAI chat 客户端**：
+搜索/抓取是自有 JSON 接口，不是 chat completions 格式，也不共享 base_url 语义。
+
+#### 签名
+
+```python
+def build_web_tools(*, settings: Settings, tool_outputs_dir: Path) -> list[BaseTool]
+
+WebSearch(query: str, count: int = 5, need_content: bool = False) -> dict
+WebFetch(url: str) -> dict
+```
+
+- `query`：1–128 字符，支持 `site:` / `-site:` / `-词` / `"短语"` / `lang:` / `after:` / `before:`；
+  不做二次改写、不加隐式引号；
+- `count`：1–50，默认取 `settings.web_search_default_count`（5）；越界按边界截断并在返回里注明；
+- `need_content`：默认 `settings.web_search_need_content`（`False`）。默认关闭的理由是实测：`need_content=true`
+  时单条 `content` 可达 4.5k 字符，5 条就接近 15k 字符，容易顶爆上下文；需要正文时优先用 `WebFetch`；
+- `url`：必须带 host 的 `http/https`，≤8192 字符，拒绝含账号密码的 URL（发送前校验，返回 `invalid_args`）。
+
+#### 请求
+
+```
+POST {search_api_base_url}/v1/tools/search
+Authorization: Bearer <DEEPSEEK_SEARCH_API_KEY>
+Content-Type: application/json
+{"query": str, "count": int, "need_content": bool}
+
+POST {search_api_base_url}/v1/tools/fetch
+{"url": str}
+```
+
+#### 返回结构（实测字段，2026-11-09）
+
+```jsonc
+// WebSearch
+{"ok": true, "query": "...", "count": 5, "results": [
+  {"title": str, "url": str, "snippet": str, "summary": str,
+   "content": str,          // need_content=false 时为 ""（长度 0），true 时为 Markdown 正文
+   "site_name": str, "site_icon": str, "authority": int,
+   "rerank_score": float, "date": "2025-10-08T16:00:00+00:00"}
+]}
+
+// WebFetch
+{"ok": true, "url": "...", "title": str, "content": str}   // content 为 Markdown
+```
+
+- `summary` 在 `need_content=false` 时**也有值**（实测 138–669 字符），不要把它当 `content` 的别名；
+- `content` 为 `""` 表示未请求正文，不是抓取失败。
+
+#### 错误映射（与 `tools/errors.py` 的 8 类一致，新增第 9 类 `not_configured`）
+
+| HTTP / 情况 | `error_class` | 是否可重试 | 说明 |
+|---|---|---|---|
+| 未配置 `DEEPSEEK_SEARCH_API_KEY` | `not_configured` | ❌ | 立即返回，**禁止回退到 `LLM_API_KEY`**，禁止伪造结果 |
+| 参数不合法（query 空/超长、count 越界、url 非法） | `invalid_args` | ❌ | 本地校验，不发请求 |
+| 400 | `invalid_args` | ❌ | 贴服务端 `error` 原文 |
+| 401 | `auth_error` | ❌ | 凭证无效；**单独归类**，见下 |
+| 402 | `insufficient_balance` | ❌ | **单独归类，禁止重试**：每次重试都在扣预算 |
+| 403 | `forbidden` | ❌ | 安全策略拒绝，通常是内容问题，重试无用 |
+| 404（fetch） | `not_found` | ❌ | 抓不到正文（页面需登录/反爬）；可提示改用 search 的 `summary` |
+| 408 | `timeout` | ✅ 1 次 | 与原请求同参数重试一次 |
+| 413 | `invalid_args` | ❌ | 请求体过大（fetch 的 url 太长） |
+| 429 | `rate_limited` | ✅ 退避 1 次 | QPS 超限；search 100 QPS / fetch 25 QPS |
+| 5xx | `upstream_error` | ✅ 1 次 | 计入熔断预算 |
+| 网络异常 / 超时 | `timeout` / `network_error` | ✅ 1 次 | 计入熔断预算 |
+
+- **401 / 402 必须与普通失败分开**：`402 余额不足` 若进入重试或熔断预算统计，会白烧调用额度；
+  这两类直接向上抛「不可重试」，由 router 告知用户，不进 worker 的重试循环。
+- 只有 408/429/5xx/网络异常计一次重试（总计 ≤1 次）；其余一次即返回。
+
+#### 落盘 stub 规则
+
+- `WebFetch.content` 与 `WebSearch` 单条 `content` 超过 `tools/paths.py` 的公共阈值时，
+  写入 `tool_outputs/<trace_id>/<tool_call_id>-<n>.md`，返回值里替换为
+  **与 Shell/Read 完全相同的 stub 文本**（复用 `tools/paths.py` 的格式化函数，
+  禁止另写一套）。`title` / `url` / `snippet` 永不落盘（体积小且是定位信息）。
+- 实测 `content` 典型长度：search `0`（false）/ `1.1k–4.5k`（true）；fetch `0.2k–2.2k`。
+  阈值建议沿用现有公共默认值（先不改），等出现 >8k 的真实样本再评估。
+
+#### 凭证隔离（硬约束）
+
+- Web 工具**只**读 `settings.deepseek_search_api_key`；
+  LLM 客户端**只**读 `settings.llm_api_key`。两边都**禁止** fallback 到对方，
+  也禁止接受"用 LLM key 试一次"的实现。
+- 所有日志/异常必须脱敏：只允许打印 `sk-xxxx...last4` 形式的前缀+后四位，禁止打印完整 key。
+- **`DEEPSEEK_SEARCH_API_KEY` 曾以明文出现在对话记录中，需轮换。** 轮换后只更新 `.env`，不入库、不提交。
+
+#### 联调实测记录（2026-11-09，凭证已脱敏）
+
+| 请求 | 状态 | 延迟 | 结果 |
+|---|---|---|---|
+| `GET /user/balance` | 200 | 0.82s | `is_available=true`，余额 `CNY 10.59` |
+| `POST /v1/tools/search`（`need_content=false`, count=5） | 200 | 0.75s | 5 条，`content` 全为 `""`，`summary` 有值 |
+| `POST /v1/tools/search`（`need_content=true`, count=5） | 200 | 0.78s | `content` 1094–4499 字符 |
+| `POST /v1/tools/fetch` | 200 | 0.22s | `title` 28 字，`content` 1733 字符 Markdown |
+
+字段与官方文档完全一致，无缺失/改名。**注意**：`/user/balance` 属于平台通用接口，
+它接受该 key 不代表其可用于 chat completions——两者仍是不同凭证，不得混用。
+
 ---
 
 ## 8. Agent 装配（`agents/`）
@@ -787,6 +888,8 @@ def supervisor_loop(settings, bus, store, stop_event)   # 1s 心跳/待处理；
 | `tools/fs.py` | M-FS | contracts | ❌ | `scripts/check_fs.py` |
 | `tools/paths.py` | M-FS | 标准库 | ❌ | 同上 |
 | `scripts/check_fs.py` | M-FS | — | ❌ | 退出码 0 |
+| `tools/web.py` | M-WEB（批次 C） | contracts, tools.paths, tools.errors, config | ❌ | `scripts/check_web.py` |
+| `scripts/check_web.py` | M-WEB（批次 C） | — | ❌ | 退出码 0 |
 | `store/sqlite.py` | M-STORE | contracts | ❌ | `scripts/check_store.py` |
 | `store/checkpointer.py` | M-STORE | psycopg, langgraph | ❌ | 同上 |
 | `memory/jsonl.py` | M-STORE | contracts | ❌ | 同上 |
@@ -884,17 +987,28 @@ requirements.txt
 | 6 | `check_worker_tools`：SendMessage notify 立即返回；ask 超时文案；Web 失败结构化 | 全过 |
 | 7 | `check_memory`：预算裁剪保留最后 HumanMessage、tool 成对；折叠切点安全 | 全过 |
 | 8 | `scripts/selfcheck.py`：Redis group、PG checkpoint 读写、SQLite 表、工具路径守卫 | 退出码 0 |
-| 9 | `scripts/check_contracts.py`：`adapt_messages` 在 `llm_supports_vision=False` 时把 image 块换成文本、文本块保留；`True` 时原样返回 | 全过 |
-| 10 | 端到端：手机发"你好" → router 回 ReplyUser；派"看下 workspace 有什么" → worker_result → router 再回一次 | 未完成：缺 LLM 凭证（见下方实测记录） |
+| 9 | `scripts/check_contracts.py`：契约核心（33 项）；含 Vision 中间件 checkpoint 保留原图、`Bus.lag` 的 ACK 后归零与 `lag=None` 兜底、Thread 私有属性不遮蔽、lark 惰性导入（子进程） | 全过（2026-11-09：33 通过 / 0 失败） |
+| 10 | 端到端：手机发"你好" → router 回 ReplyUser；派"看下 workspace 有什么" → worker_result → router 再回一次 | ✅ console 模式已跑通（2026-11-09，见下方实测记录）；真机飞书发送仍需用户确认 |
 
-**端到端实测记录（2026-11-08，console 模式）**
+**端到端实测记录（2026-11-09，console 模式，真实模型）**
 
-- ✅ `gateway --send` → 入队 → supervisor 拉起 router 子进程 → 消费者组读到消息（`lag` 归零）
-- ✅ router 装配成功（`create_agent` + 9 个工具：ReplyUser + 8 个 session 工具）
-- ✅ worker 真实拉起：`create_session` → `worker_runner.py` → 读到 `task.json` → 失败仍 `XADD worker_result(status="error")` → sessions 行转为 `error` 且写入 `first_message_at`
-- ✅ gateway 对异常退出按退避策略重拉，连续 5 次后停止；`Ctrl-C`/超时停止子进程无残留
-- ❌ **阻塞层：LLM 凭证缺失**。当前 `.env` 的 `LLM_API_KEY` / `LLM_BASE_URL` 为空，模型调用返回 `401`（`https://api.openai.com/v1/chat/completions`），router 因此无法产生任何工具调用，闭环停在"模型层"。
-  该层一旦可用，`ReplyUser → channel.send_text` 是唯一未跑的路径（其余链路均已实测通）。
+模型：`DeepSeek-V4.1-Flash-1017-Event` @ `https://api.scnet.cn/api/llm/v1`。
+
+```
+18:51:37 处理批次 3 条：user_message ×3（含 11-08 遗留未消费消息）
+18:51:40 模型产出：消息 11 条，工具调用 1 次 ['create_session']；回复 40 字
+          模型原文：已派发 worker 去创建 e2e_hello.txt，完成后会把结果告诉你。
+18:51:45 worker 创建 C:\Users\34897\assistant-workspace\e2e_hello.txt（12 字节，内容「闭环成功」）
+18:51:51 处理批次 1 条：worker_result
+18:51:54 模型产出：消息 15 条，工具调用 2 次 ['create_session', 'ReplyUser']；回复 25 字
+          模型原文：已完成：文件已创建并校验通过，内容为「闭环成功」。
+[console-send] 已完成：C:\Users\34897\assistant-workspace\e2e_hello.txt 已创建……校验通过。
+18:52:55 空闲 60s 且无待处理事件，退出 code=0
+```
+
+- ✅ 全链路：gateway 入队 → supervisor 拉起 router → 模型真实工具调用 → worker 进程 → worker_result → ReplyUser 可见回复
+- ✅ 思考模式：`LLM_THINKING_DISABLED=true` 时模型正常返回；该端点为 OpenAI 兼容网关，**不校验未知 `extra_body` 字段**（塞入不存在的字段仍 200），因此"被接受"不能证明"被实现"；关闭/开启两种情况下两轮对话均未出现 400（详见 §14-38）
+- ✅ 真实飞书发送**未执行**（按约定需用户确认后才做）
 
 ---
 
@@ -934,6 +1048,13 @@ requirements.txt
 | 30 | 设计文档写 worker 完成后回传结果，未规定失败路径 | 失败也必须 `XADD worker_result(status="error")`，否则 router 永远等不到回报（§9.2） |
 | 31 | `Thread` 子类把停机事件命名为 `_stop` 会遮蔽 `threading.Thread._stop()`，`join()` 抛 `TypeError` | 统一命名 `_stop_event`（已实测踩坑，写进契约防复发） |
 | 32 | `ReplyUser` 工厂函数漏 `return`，导致工具列表里出现 `None`，`create_agent` 报 `'function' object has no attribute 'name'` | 已修；`build_*_tools()` 必须有返回值，工具对象类型断言留给 `check_router_tools` |
+| 33 | `XINFO GROUPS` 在 stream 被 `MAXLEN` 裁剪过时返回 `lag=None`；早期实现兜底成 `pending`(=0)，supervisor 认为"没活" | `lag()` 兜底改为比较 `last-generated-id` 与组 `last-delivered-id`；断言 `lag_none_fallback_positive` 覆盖（实测曾因此 180s 不拉 router） |
+| 34 | 搜索/抓取需要独立凭证，契约原无对应配置项 | 新增 `deepseek_search_api_key` / `search_api_base_url` / `web_search_*`（§7.7）；与 `llm_api_key` **禁止互 fallback** |
+| 35 | 独立 `tools/web.py` 不复用 OpenAI 客户端 | 采纳：搜索/抓取是自有 JSON 协议；错误码映射新增 `not_configured` 与独立的 `auth_error` / `insufficient_balance`（不重试） |
+| 36 | 真实凭证曾以明文出现在对话记录（LLM key、搜索 key） | 只落 `.env`（已 gitignore）；日志仅允许 `sk-xxxx…last4`；**两把 key 均需轮换** |
+| 37 | `tools/__init__.py`、`channel/factory.py`、`main_*.py` 不在原归属表 | 归 M0 主线（已在 §10 补齐）；批次 C 的 `tools/web.py` + `check_web.py` 单独归属 |
+| 38 | 该 LLM 端点不校验未知 `extra_body` 字段（塞 `this_field_does_not_exist` 仍 200），因此无法用"请求成功"证明 `thinking.disabled` 被实现 | 结论：`LLM_THINKING_DISABLED=true` 在当前端点**不报错但无法证明生效**；开启思考模式的两轮对话也未出现 400。保留默认 `true`（确定性），待有 `reasoning_content` 可观测时再验证 |
+| 39 | 修复类改动缺少自动回归断言 | 四条摩擦各有断言，见 §13-9：`channel_factory_lazy_lark_subprocess`、`heartbeat_join_ok` + `thread_no_stdlib_shadow:*`、`lag_after_ack_zero_not_xlen` + `lag_none_fallback_positive`、`vision_checkpoint_keeps_image` + `vision_request_downgraded` |
 
 ---
 

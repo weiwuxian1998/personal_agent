@@ -97,6 +97,132 @@ def main() -> int:
     check("bus_lag_exists", callable(getattr(Bus, "lag", None)))
     check("event_source_console", "console" in EVENT_SOURCES)
 
+    # ------------------------------------------------ lark 惰性导入（子进程实测）
+    # 同进程的 sys.modules 断言可能被前面的 import 污染，这里用全新解释器验证
+    import subprocess  # noqa: E402
+
+    probe = subprocess.run(
+        [sys.executable, "-c", "import sys, channel.factory; print('lark_oapi' in sys.modules)"],
+        cwd=str(ROOT), capture_output=True, text=True, timeout=180,
+    )
+    check("channel_factory_lazy_lark_subprocess", probe.stdout.strip() == "False", probe.stdout + probe.stderr)
+
+    # ------------------------------------------------ Bus.lag 行为（真实 Redis）
+    import redis as _redis  # noqa: E402
+    import uuid as _uuid  # noqa: E402
+
+    client = _redis.from_url(settings.redis_url, decode_responses=True, socket_timeout=5)
+    try:
+        client.ping()
+    except Exception as exc:  # noqa: BLE001
+        check("redis_available", False, str(exc)[:120])
+    else:
+        name = f"asst:test:contract:{_uuid.uuid4().hex[:8]}"
+        b = Bus(client)
+        b.stream, b.group = name, "g"
+        try:
+            client.xgroup_create(name, "g", id="0", mkstream=True)
+            b.xadd(new_event("user_message", "console", {"text": "x"}), stream=name, maxlen=100)
+            check("lag_undelivered_positive", b.lag() == 1, f"lag={b.lag()}")
+            entries = b.read_batch(block_ms=100, count=10)
+            b.ack(entries)
+            # 关键断言：XACK 后条目仍留在 stream（xlen>0），但 lag 必须归零。
+            # 任何把判断改回 XLEN 的改动都会让这条失败。
+            check("lag_after_ack_zero_not_xlen", b.lag() == 0 and b.xlen() > 0,
+                  f"lag={b.lag()} xlen={b.xlen()}")
+        finally:
+            client.delete(name)
+
+        # 被 MAXLEN 裁剪后 Redis 返回 lag=None；此时必须仍能识别「有未投递事件」，
+        # 否则 supervisor 永远不拉 router（已实测 180s 无人消费）。
+        trimmed = f"asst:test:contract:{_uuid.uuid4().hex[:8]}"
+        b2 = Bus(client)
+        b2.stream, b2.group = trimmed, "g"
+        try:
+            client.xgroup_create(trimmed, "g", id="0", mkstream=True)
+            for _ in range(5):
+                b2.xadd(new_event("user_message", "console", {"text": "x"}), stream=trimmed, maxlen=1)
+            raw = client.xinfo_groups(trimmed)[0]
+            check("lag_none_fallback_positive", b2.lag() > 0,
+                  f"raw_lag={raw.get('lag')} computed={b2.lag()}")
+        finally:
+            client.delete(trimmed)
+
+    # ------------------------------------------------ Thread 子类不得遮蔽标准库属性
+    import threading  # noqa: E402
+
+    import main_gateway  # noqa: E402
+    import main_router  # noqa: E402
+
+    thread_classes = [
+        obj for module in (main_gateway, main_router)
+        for obj in vars(module).values()
+        if isinstance(obj, type) and issubclass(obj, threading.Thread) and obj.__module__ == module.__name__
+    ]
+    check("thread_classes_found", len(thread_classes) >= 2, f"found={[c.__name__ for c in thread_classes]}")
+    # 只查 Thread 的**私有**属性（`_stop` / `_tstate_lock` / `_started` 等）；
+    # `run` / `__init__` 是本就要覆盖的公开接口，双下划线是解释器保留名。
+    inherited_private = {
+        name for name in dir(threading.Thread) if name.startswith("_") and not name.startswith("__")
+    }
+    check("thread_private_attrs_probe", "_stop" in inherited_private)
+    for cls in thread_classes:
+        clash = set(cls.__dict__) & inherited_private
+        check(f"thread_no_stdlib_shadow:{cls.__name__}", not clash, f"clash={sorted(clash)}")
+
+    class _FakeRedis:
+        def set(self, *args, **kwargs):
+            return True
+
+    hb = main_router.Heartbeat(_FakeRedis(), 10)
+    hb.start()
+    try:
+        hb.stop()  # 内部 join(timeout=2)；若遮蔽 Thread._stop 会抛 TypeError
+        check("heartbeat_join_ok", True)
+    except TypeError as exc:
+        check("heartbeat_join_ok", False, str(exc))
+
+    # ------------------------------------------------ Vision 中间件：checkpoint 保留原图
+    from langchain.agents import create_agent  # noqa: E402
+    from langchain_core.language_models.chat_models import BaseChatModel  # noqa: E402
+    from langchain_core.messages import AIMessage, HumanMessage  # noqa: E402
+    from langchain_core.outputs import ChatGeneration, ChatResult  # noqa: E402
+    from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
+
+    received: list = []
+
+    class _EchoModel(BaseChatModel):
+        @property
+        def _llm_type(self) -> str:
+            return "echo"
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            received.append(list(messages))
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+    from agents.middleware import VisionAdapterMiddleware  # noqa: E402
+
+    settings.llm_supports_vision = False
+    graph = create_agent(
+        model=_EchoModel(), tools=[], system_prompt="s",
+        middleware=[VisionAdapterMiddleware(settings)],
+        checkpointer=InMemorySaver(), name="vision-check",
+    )
+    cfg = {"configurable": {"thread_id": "vision-check"}}
+    image_block = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+    graph.invoke({"messages": [HumanMessage(content=[{"type": "text", "text": "看图"}, image_block])]}, cfg)
+
+    saved = graph.get_state(cfg).values["messages"]
+    saved_human = [m for m in saved if isinstance(m, HumanMessage)][0]
+    saved_types = [b.get("type") for b in saved_human.content]
+    check("vision_checkpoint_keeps_image", "image_url" in saved_types, f"saved_blocks={saved_types}")
+
+    sent_types = [b.get("type") for m in received[0] for b in (m.content if isinstance(m.content, list) else [])]
+    check("vision_request_downgraded", "image_url" not in sent_types, f"sent_blocks={sent_types}")
+
     print(f"\n{len(failures)} failure(s)")
     return 1 if failures else 0
 

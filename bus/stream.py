@@ -182,7 +182,11 @@ class Bus:
 
         gateway 的 supervisor 用它判断「有活要干」，不能用 `XLEN`：
         XACK 不会删除条目，`XLEN` 永远大于 0，会导致 router 被反复拉起。
-        旧版本 Redis 没有 `lag` 字段时退化为「未确认数」，只影响拉起时机，不丢事件。
+
+        注意：**stream 被 `MAXLEN` 裁剪过时 Redis 会返回 `lag=None`**（无法精确计算），
+        此时不能退化成 `pending`——那会把「有新消息但未投递」误判成「没活」，
+        supervisor 永远不拉 router（已实测：消息滞留在 stream 里 180s 无人消费）。
+        兜底改为比较组已投递位置与 stream 最后生成的 ID：两者不同即视为有活。
         """
         groups = self.client.xinfo_groups(self.stream) or []
         for group in groups:
@@ -192,8 +196,17 @@ class Bus:
             value = normalized.get("lag")
             if value is not None:
                 return int(value)
+            last_delivered = _text(normalized.get("last-delivered-id") or "0-0")
+            last_generated = self._last_generated_id()
+            if last_generated and last_generated != last_delivered:
+                return 1
             return int(normalized.get("pending", 0) or 0)
         return 0
+
+    def _last_generated_id(self) -> str:
+        info = self.client.xinfo_stream(self.stream) or {}
+        normalized = {_text(k): v for k, v in info.items()}
+        return _text(normalized.get("last-generated-id") or "")
 
     def xlen(self) -> int:
         return int(self.client.xlen(self.stream))

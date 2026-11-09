@@ -54,6 +54,17 @@ class Settings(BaseSettings):
     # deepseek-flash 为文本模型，v1 默认 False。
     llm_supports_vision: bool = False
 
+    # ---------- DeepSeek Web 工具（契约 §7.7） ----------
+    # 搜索/抓取专用凭证，**只用于 /v1/tools/search 与 /v1/tools/fetch**。
+    # 与 llm_api_key 物理隔离：两边都不允许 fallback 到对方（代码层面禁止互读）。
+    # 未配置时 WebSearch/WebFetch 返回结构化 not_configured，不做任何降级。
+    deepseek_search_api_key: str = ""
+    search_api_base_url: str = "https://api.deepseek.com"
+    # need_content 默认值：false 只返回 snippet/summary，正文按需开启（省时省钱）
+    web_search_need_content: bool = False
+    web_search_default_count: int = 5
+    web_search_timeout_s: float = 30.0
+
     # ---------- 运行目录（与代码分离，文档 §2.3） ----------
     data_dir: Path = Path.home() / ".assistant"
     workspace_root: Path = Path.home() / "assistant-workspace"

@@ -310,6 +310,28 @@ def main() -> int:
         web_mod._call_json = _orig_call_json
         settings.deepseek_search_api_key = _orig_search_key
 
+    # ------------------------------------------------ 思考模式开关的接线（真实效果靠 §14-38 的 reasoning_tokens 实测）
+    from agents.base import build_chat_model  # noqa: E402
+
+    _orig_thinking_disabled = settings.llm_thinking_disabled
+    try:
+        settings.llm_thinking_disabled = True
+        thinking_off = build_chat_model(settings)
+        check(
+            "thinking_switch_off_extra_body",
+            getattr(thinking_off, "extra_body", None) == {"thinking": {"type": "disabled"}},
+            f"extra_body={getattr(thinking_off, 'extra_body', None)}",
+        )
+        settings.llm_thinking_disabled = False
+        thinking_on = build_chat_model(settings)
+        check(
+            "thinking_switch_on_no_extra_body",
+            not getattr(thinking_on, "extra_body", None),
+            f"extra_body={getattr(thinking_on, 'extra_body', None)}",
+        )
+    finally:
+        settings.llm_thinking_disabled = _orig_thinking_disabled
+
     print(f"\n{len(failures)} failure(s)")
     return 1 if failures else 0
 

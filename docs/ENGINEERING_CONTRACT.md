@@ -1016,7 +1016,7 @@ requirements.txt
 | 6 | `check_worker_tools`：SendMessage notify 立即返回；ask 超时文案；Web 失败结构化 | 全过 |
 | 7 | `check_memory`：预算裁剪保留最后 HumanMessage、tool 成对；折叠切点安全 | 全过 |
 | 8 | `scripts/selfcheck.py`：Redis group、PG checkpoint 读写、SQLite 表、工具路径守卫 | 退出码 0 |
-| 9 | `scripts/check_contracts.py`：契约核心（35 项）；含 Vision 中间件 checkpoint 保留原图、`Bus.lag` 的 ACK 后归零与 `lag=None` 兜底、Thread 私有属性不遮蔽、lark 惰性导入（子进程）、artifact 路径含真实 `tool_call_id` | 全过（2026-11-09：35 通过 / 0 失败） |
+| 9 | `scripts/check_contracts.py`：契约核心（37 项）；含 Vision 中间件 checkpoint 保留原图、`Bus.lag` 的 ACK 后归零与 `lag=None` 兜底、Thread 私有属性不遮蔽、lark 惰性导入（子进程）、artifact 路径含真实 `tool_call_id`、思考开关接线 | 全过（2026-11-09：37 通过 / 0 失败） |
 | 10 | 端到端：手机发"你好" → router 回 ReplyUser；派"看下 workspace 有什么" → worker_result → router 再回一次 | ✅ console 模式已跑通（2026-11-09，见下方实测记录）；真机飞书发送仍需用户确认 |
 
 **端到端实测记录（2026-11-09，console 模式，真实模型）**
@@ -1036,7 +1036,11 @@ requirements.txt
 ```
 
 - ✅ 全链路：gateway 入队 → supervisor 拉起 router → 模型真实工具调用 → worker 进程 → worker_result → ReplyUser 可见回复
-- ✅ 思考模式：`LLM_THINKING_DISABLED=true` 时模型正常返回；该端点为 OpenAI 兼容网关，**不校验未知 `extra_body` 字段**（塞入不存在的字段仍 200），因此"被接受"不能证明"被实现"；关闭/开启两种情况下两轮对话均未出现 400（详见 §14-38）
+- ✅ 思考模式（2026-11-09 已实测定性）：`LLM_THINKING_DISABLED=true` **确实生效**——
+  关闭时 `usage.completion_tokens_details.reasoning_tokens = 0` 且无 `reasoning_content`；
+  不传该字段时默认**开启**（108 / 112 reasoning tokens，同题）。判据只能看 `usage`，
+  不能看 `additional_kwargs`：`langchain-openai 1.7.4` 会丢弃 `reasoning_content`（§14-46）。
+  关闭 / 开启、带工具 / 不带工具的第二轮共 12 组组合全部 200，**本端点不要求回传 `reasoning_content`**（§14-38）。
 - ✅ 真实飞书发送**未执行**（按约定需用户确认后才做）
 
 ---
@@ -1053,7 +1057,7 @@ requirements.txt
 | 6 | Shell 返回体 §6.2 有 `truncated`，§7.3.4 用 `artifact/total_lines/total_bytes` | 以 §7.3.4 为准；额外保留 `truncated: bool` 兼容旧描述 |
 | 7 | `sessions.status` 文档多处枚举不完全一致 | 统一为 `running/waiting_router/idle/stopped/error/done/unreachable`（`contracts.SessionStatus`） |
 | 8 | `TaskOutput` 有 `session_id`，`StopCommand` 有 `task_id` | 所有 session 工具内部接受两种写法并归一化为 `worker:<ulid>` |
-| 9 | §10.2 思考模式 + 工具调用可能 400（未验证） | v1 默认 `LLM_THINKING_DISABLED=true`；真 key 实验后再改默认值 |
+| 9 | §10.2 思考模式 + 工具调用可能 400（原判"未验证"） | 已实测（§14-38）：开关**有效**，默认开启、关闭后 reasoning_tokens=0；本端点**不要求**回传 `reasoning_content`。v1 默认 `LLM_THINKING_DISABLED=true`（成本确定性） |
 | 10 | `ReplyUser` 需要 `chat_id`，但工具签名没有 | 由 runtime contextvar `current_chat_id` 提供；gateway 每批把最后一条用户消息的 chat_id 写 `asst:router:state` 兜底 |
 | 11 | 设计文档 §6.2 router 工具含 `ToolSearch/DeferExecuteTool` 仅服务 `fork_session` | v1 注册这两个工具但只允许 `fork_session`；`fork_session` 用 `checkpointer.get_tuple + put` 复制 thread |
 | 12 | `langchain` 版本文档未定 | 实测 `langchain 1.4.9` + core 1.7.6 可 `from langchain.agents import create_agent`，锁定该版本 |
@@ -1082,7 +1086,7 @@ requirements.txt
 | 35 | 独立 `tools/web.py` 不复用 OpenAI 客户端 | 采纳：搜索/抓取是自有 JSON 协议；错误码映射新增 `not_configured` 与独立的 `auth_error` / `insufficient_balance`（不重试） |
 | 36 | 真实凭证曾以明文出现在对话记录（LLM key、搜索 key） | 只落 `.env`（已 gitignore）；日志仅允许 `sk-xxxx…last4`；**两把 key 均需轮换** |
 | 37 | `tools/__init__.py`、`channel/factory.py`、`main_*.py` 不在原归属表 | 归 M0 主线（已在 §10 补齐）；批次 C 的 `tools/web.py` + `check_web.py` 单独归属 |
-| 38 | 该 LLM 端点不校验未知 `extra_body` 字段（塞 `this_field_does_not_exist` 仍 200），因此无法用"请求成功"证明 `thinking.disabled` 被实现 | 结论：`LLM_THINKING_DISABLED=true` 在当前端点**不报错但无法证明生效**；开启思考模式的两轮对话也未出现 400。保留默认 `true`（确定性），待有 `reasoning_content` 可观测时再验证 |
+| 38 | 该端点不校验未知 `extra_body` 字段，**不能**用"请求成功"证明 `thinking.disabled` 被实现；此前据此判"无法验证" | **已推翻，开关有效**（2026-11-09 直连实测，同一题）：「不传」= 108 / 112 reasoning tokens 且有 `reasoning_content`；`thinking={"type":"disabled"}` = **0** reasoning tokens、无 `reasoning_content`；`enabled` = 117。带工具时同样成立（disabled 0 / 默认 0 或 57 / enabled 16）。判据只看 `usage.completion_tokens_details.reasoning_tokens`（或 LangChain 的 `usage_metadata.output_token_details["reasoning"]`），**不能看 `additional_kwargs`**（见 §14-46）。默认关闭的成本意义：同题开启时每轮多 60–120 个 reasoning 输出 token。第二轮回传/丢弃/空串 `reasoning_content` × thinking 默认/enabled/disabled 共 12 组全部 200，**本端点不要求回传**，故"漏回传导致 400"在本端点不成立（官方 `deepseek-reasoner` 文档的要求不适用于此网关） |
 | 39 | 修复类改动缺少自动回归断言 | 四条摩擦各有断言，见 §13-9：`channel_factory_lazy_lark_subprocess`、`heartbeat_join_ok` + `thread_no_stdlib_shadow:*`、`lag_after_ack_zero_not_xlen` + `lag_none_fallback_positive`、`vision_checkpoint_keeps_image` + `vision_request_downgraded` |
 | 40 | §7.5 与 §7.7 并存两套 `build_web_tools` 签名、两套错误类（`{http_error, network, quota}` vs 11 类表） | **以 §7.7 为准**：§7.5 只保留模块位置说明，删除 `build_web_tools(api_key=...)` 与三类旧错误；`api_key` 作入参会让装配层误传 LLM key，与凭证隔离冲突 |
 | 41 | §7.7 签名写死 `count=5 / need_content=False`，正文又说"默认取 settings" | 二选一取**签名默认值即契约**；`config.py` 删除 `web_search_default_count` / `web_search_need_content`，杜绝两套默认值。要改默认值须走变更流程改签名（`None` 哨兵） |
@@ -1090,6 +1094,7 @@ requirements.txt
 | 43 | §7.7 要求落盘到 `tool_outputs/<trace_id>/<tool_call_id>-<n>.md`，但仓库里**无人给 `current_tool_call_id` 赋值**（`check_web.py` 手工 set，掩盖了缺口） | 新增 §8.3-10 `ToolContextMiddleware`（`wrap_tool_call` set/reset），router/worker 均已接入；断言 `tool_artifact_path_uses_tool_call_id`（真实 graph + 真实 `tools/web.py`，只桩 HTTP），反证 `tool_artifact_path_without_middleware_loses_id` |
 | 44 | §7.7 返回体未写 `truncated` / `artifact` | 记为**向后兼容增字段**（成对出现，仅 content 落盘时出现）；已补进 §7.7 返回结构 |
 | 45 | `search(need_content=true)` 与 `fetch` 返回正文高度重叠（实测同一页面均 13081 字符），模型容易先 search 再逐条 fetch | 工具 description 与 §7.7「Prompt 指引」都明确：优先 `WebSearch(need_content=true)`，`WebFetch` 只用于已知 URL；避免同一批正文付两次费 |
+| 46 | `langchain-openai 1.7.4` 的 `ChatOpenAI` 只解析 OpenAI 标准字段，**静默丢弃**第三方扩展字段 `reasoning_content` | 已在源码确认（`chat_models/base.py::_convert_dict_to_message` 只读 `content/function_call/tool_calls/audio/refusal`；模块 docstring 明确写 "`reasoning_content` are **not** extracted"）；实测同一请求：`additional_kwargs=['refusal']` 但 `usage_metadata.output_token_details={"reasoning": 102}`。**已知限制**：v1 不需要接管请求层——默认已关闭思考、无 `reasoning_content` 可丢，且本端点不要求回传；若未来要保留思考链（展示或回传），必须改用 `ChatDeepSeek` 或自定义 `BaseChatModel`（自带 HTTP 层），不能继续用 `ChatOpenAI` |
 
 ---
 

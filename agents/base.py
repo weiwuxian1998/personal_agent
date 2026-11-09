@@ -47,8 +47,9 @@ def build_chat_model(settings: Settings) -> ChatOpenAI:
         "temperature": 0,
     }
     if settings.llm_thinking_disabled:
-        # DeepSeek 思考模式 + 工具调用需要回传 reasoning_content（文档 §10.2）；
-        # v1 先关闭，等真 key 验证后再改默认。
+        # 契约 §14-38 已实测：`thinking.type=disabled` 在当前端点**确实生效**
+        # （reasoning_tokens 0 vs 默认 108–119）。默认关闭是为了成本确定性：
+        # 同一问题关闭时 0 reasoning tokens，开启时每轮多 60–120 个输出 token。
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     return ChatOpenAI(**kwargs)
 

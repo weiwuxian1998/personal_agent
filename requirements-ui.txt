@@ -1,0 +1,5 @@
+# Web UI 适配器额外依赖（protocol_adapter.py 专用）
+# 主链路依赖见 requirements.txt（冻结）；本文件不改动主链路环境约束。
+# 安装：pip install -r requirements-ui.txt
+fastapi>=0.115
+uvicorn[standard]>=0.30

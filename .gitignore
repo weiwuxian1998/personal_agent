@@ -1,6 +1,7 @@
 # 凭证：任何情况下都不入库
 .env
-.env.local
+.env.*
+!.env.example
 *.pem
 *.key
 
@@ -14,7 +15,16 @@ venv/
 # 运行期数据（默认在 ~/.assistant，若改到仓库内也不入库）
 logs/
 data/
+assistant-data/
 *.log
+*.log.*
+
+# 中间产物 / 依赖
+out/
+**/node_modules/
+**/dist/
+.vite/
+*.tsbuildinfo
 
 # IDE / 临时
 .trae/

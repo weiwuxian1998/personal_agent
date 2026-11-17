@@ -7,6 +7,7 @@
 - 失败不抛异常，统一返回 `contracts.tool_error(...)`；
 - 工具无状态：不缓存、不记忆上次读写；
 - Write / Edit 走"同目录临时文件 + `os.replace`"，避免写到一半的内容；
+  Write 的 append 模式同样读原文拼接后原子写回，并保留原文件编码；
 - 不新增 ListDir / SearchFiles 等同义工具。
 
 超长处理：
@@ -19,7 +20,6 @@
 
 from __future__ import annotations
 
-import base64
 import fnmatch
 import heapq
 import os
@@ -29,13 +29,18 @@ from typing import Any, Literal
 
 from langchain_core.tools import BaseTool, tool
 
+from agents.vision import format_image_reference
 from contracts import tool_error, ulid
 from tools.paths import (
     EXCLUDED_DIR_NAMES,
     has_excluded_part,
     relative_display,
+    resolve_in_roots,
     resolve_in_workspace,
+    resolve_readonly_hit,
+    root_of,
 )
+from tools.rules import MAX_BATCH_FILES, is_forbidden, move_to_recycle_bin
 
 # ---------------------------------------------------------------- 限额常量
 # 图片：base64 后体积 ×4/3，4 MB 原图约 5.3 MB 文本，已是单次工具结果的合理上限
@@ -63,6 +68,9 @@ MIME_BY_EXT: dict[str, str] = {
 
 _WRITE_HINT = "请用相对工作区根或工作区内绝对路径重试；工作区外文件不允许读写。"
 _OUTSIDE_HINT = "路径必须位于 workspace_root 之内（不允许 ../ 或符号链接逃逸）。"
+_READ_HINT = "路径必须位于 workspace_root 或只读附件目录内（不允许 ../ 或符号链接逃逸）。"
+_READONLY_HINT = "附件目录只读；把产出写到 workspace_root 内，附件仅用于读取。"
+_FORBIDDEN_HINT = "系统目录（C:\\Windows、AppData、Program Files 等）是硬禁区，写入/删除一律拒绝。"
 
 
 # ---------------------------------------------------------------- 内部工具函数
@@ -174,14 +182,26 @@ def build_fs_tools(
     workspace_root: Path,
     tool_outputs_dir: Path,
     max_read_lines: int = 2000,
+    read_roots: list[Path] | None = None,
+    write_roots: list[Path] | None = None,
 ) -> list[BaseTool]:
     """构造文件工具集，顺序固定为 [Read, Write, Edit, DeleteFile, Glob, Grep]。
 
     参数均由装配器注入（`tools.yaml` 里的 `{workspace_root}` / `{tool_outputs_dir}`）。
+    - `write_roots`（可玩耍区）：读写删都在这里；默认只有 `workspace_root`；
+    - `read_roots`（只读白名单）：如飞书附件目录、Desktop/Downloads/Documents，
+      Read/Glob/Grep 可读，Write/Edit/DeleteFile 落到那里返回 `path_read_only`；
+    - 禁区（`C:\\Windows`、`AppData` 等，见 `tools/rules.py`）即使被配成可玩耍区也拒绝，
+      返回 `error_class="path_forbidden"`。
     """
     root = Path(workspace_root).expanduser().resolve()
     outputs_dir = Path(tool_outputs_dir).expanduser()
     read_cap = max(1, int(max_read_lines))
+    read_only = [Path(item).expanduser().resolve() for item in (read_roots or [])]
+    writable = [Path(item).expanduser().resolve() for item in (write_roots or [root])]
+    if root not in writable:
+        writable.insert(0, root)
+    allowed_roots = [*writable, *read_only]
 
     # ------------------------------------------------------------ Read
     @tool("Read")
@@ -191,29 +211,32 @@ def build_fs_tools(
         limit: int = 2000,
         as_: Literal["auto", "text", "image"] = "auto",
     ) -> Any:
-        """读取工作区内的文件内容。
+        """读取工作区（或只读附件目录）内的文件内容。
 
         无状态：每次从磁盘读取，不缓存。
 
         入参：
-        - path: 工作区内路径（绝对路径，或相对 workspace_root 的相对路径）
+        - path: 工作区内路径（绝对路径，或相对 workspace_root 的相对路径）；
+          飞书附件目录也在只读白名单内，可直接读 `<attachment path="..."/>` 给的路径
         - offset: 起始行号，0 起（默认 0）
         - limit: 最多读取多少行（默认 2000，受装配时的 max_read_lines 限制）
         - as_: auto=按扩展名判断；text=强制按文本读；image=强制按图片读
 
         返回：
         - 文本文件：字符串（原文，不含行号）；被截断时结尾附 `[已截断]` 说明；
-        - 图片文件（png/jpg/jpeg/gif/webp/bmp）：内容块列表
-          `[{"type":"text",...}, {"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}]`，
-          可直接被多模态模型消费；超过 4 MB 返回 error_class="image_too_large"；
+        - 图片文件（png/jpg/jpeg/gif/webp/bmp）：单个引用文本块
+          `[{"type":"text","text":"[图片] <路径> | <mime> | <n> 字节"}]`——
+          **不内联 base64**（避免撑大 checkpoint / 日志）；由
+          `VisionAdapterMiddleware.inject_image_blocks` 在模型请求前还原成 image_url 块。
+          超过 4 MB 返回 error_class="image_too_large"；
         - 失败：`{"ok": false, "error_class": ..., "message": ..., "hint": ...}`
           （path_outside_workspace / not_found / is_directory / binary_file /
           offset_out_of_range / image_too_large / not_an_image）
         """
         try:
-            target = resolve_in_workspace(path, root)
+            target = resolve_in_roots(path, allowed_roots)
         except ValueError as exc:
-            return tool_error("path_outside_workspace", str(exc), hint=_OUTSIDE_HINT)
+            return tool_error("path_outside_workspace", str(exc), hint=_READ_HINT)
         if not target.exists():
             return tool_error(
                 "not_found",
@@ -245,20 +268,16 @@ def build_fs_tools(
                         f"图片 {size} 字节，超过上限 {MAX_IMAGE_BYTES} 字节",
                         hint="先缩小图片尺寸或压缩后再读；本工具不做自动缩放。",
                     )
-                try:
-                    data = target.read_bytes()
-                except OSError as exc:
-                    return tool_error("read_failed", f"读取图片失败: {exc}")
                 mime = MIME_BY_EXT[ext]
-                b64 = base64.b64encode(data).decode("ascii")
+                # 只回引用标记，不内联 base64：base64 会随 ToolMessage 进 checkpoint /
+                # 日志 / 消息表，把存储撑大几十倍。还原成 image_url 块由
+                # VisionAdapterMiddleware.inject_image_blocks 在每次模型请求前完成
+                # （agents/vision.py，与解析正则共享 format_image_reference 格式）；
+                # 文件读取失败时注入层保留引用文本，模型可自行决定重读。
                 return [
                     {
                         "type": "text",
-                        "text": f"[图片] {target} | {mime} | {size} 字节",
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        "text": format_image_reference(target, mime, size),
                     },
                 ]
 
@@ -320,24 +339,39 @@ def build_fs_tools(
 
     # ------------------------------------------------------------ Write
     @tool("Write")
-    def write_tool(path: str, content: str) -> dict[str, Any]:
-        """写入（覆盖）工作区内的文本文件。
+    def write_tool(path: str, content: str, mode: Literal["overwrite", "append"] = "overwrite") -> dict[str, Any]:
+        """写入工作区内的文本文件，支持覆盖与追加两种模式。
 
-        无状态：整文件覆盖，不做追加；父目录不存在会自动创建；
-        写入走"同目录临时文件 + os.replace"，不会留下半截文件。
+        无状态：mode="overwrite"（默认）整文件覆盖；mode="append" 在文件末尾追加，
+        文件不存在时行为与覆盖一致（自动创建）；父目录不存在会自动创建；
+        两种模式都走"读原文 → 拼接 → 同目录临时文件 + os.replace"，
+        不会留下半截文件；append 保留原文件编码。
 
         入参：
-        - path: 工作区内路径（绝对路径，或相对 workspace_root 的相对路径）
-        - content: 完整文件内容（UTF-8 写入，保留 \\n 不转 \\r\\n）
+        - path: 工作区内路径（绝对路径，或相对 workspace_root 的相对路径）；
+          附件目录只读，落到那里返回 error_class="path_read_only"
+        - content: 写入内容（UTF-8 写入，保留 \\n 不转 \\r\\n）；
+          overwrite 时为完整文件内容，append 时为追加片段（不做换行补齐，
+          需要另起一行请在 content 里自带 \\n）
+        - mode: "overwrite"（默认，覆盖）或 "append"（追加）
 
-        返回：`{"ok": true, "bytes": 写入字节数, "path": 绝对路径}`；
+        返回：`{"ok": true, "bytes": 写入字节数, "path": 绝对路径, "mode": mode}`；
         失败返回 `{"ok": false, "error_class": ..., "message": ..., "hint": ...}`
-        （path_outside_workspace / is_directory / write_failed）。
+        （path_outside_workspace / path_read_only / is_directory / invalid_args / write_failed）。
         """
         try:
-            target = resolve_in_workspace(path, root)
+            target = resolve_in_roots(path, writable)
         except ValueError as exc:
+            hit = resolve_readonly_hit(path, read_only, base=root)
+            if hit is not None:
+                return tool_error("path_read_only", f"附件目录只读，不能写入: {hit}", hint=_READONLY_HINT)
             return tool_error("path_outside_workspace", str(exc), hint=_OUTSIDE_HINT)
+        if is_forbidden(target):
+            return tool_error(
+                "path_forbidden",
+                f"目标落在禁区（系统目录），不允许写入: {target}",
+                hint=_FORBIDDEN_HINT,
+            )
         if target.exists() and target.is_dir():
             return tool_error(
                 "is_directory",
@@ -345,11 +379,25 @@ def build_fs_tools(
                 hint="先选一个文件名，或改用 DeleteFile 删除文件。",
             )
         data = content if isinstance(content, str) else str(content)
+        if mode not in ("overwrite", "append"):
+            return tool_error(
+                "invalid_args",
+                f"mode 只支持 'overwrite' 或 'append'，收到: {mode!r}",
+                hint="覆盖传 mode='overwrite'（默认），追加传 mode='append'。",
+            )
         try:
-            _atomic_write(target, data)
+            if mode == "append":
+                # 与覆盖/Edit 同一套原子写：读原文 → 拼接 → 临时文件 + os.replace。
+                # 直接 open("a") 追加虽多数情况可行，但崩溃/断电时可能留下半截文件，
+                # 不满足"不会留下半截文件"的契约要求；顺便保留原文件编码（GBK 等）。
+                raw = target.read_bytes() if target.exists() else b""
+                text, encoding = _decode_bytes(raw)
+                _atomic_write(target, text + data, encoding=encoding)
+            else:
+                _atomic_write(target, data)
         except OSError as exc:
             return tool_error("write_failed", f"写入失败: {exc}", hint="检查路径是否可写、磁盘是否已满。")
-        return {"ok": True, "bytes": len(data.encode("utf-8")), "path": str(target)}
+        return {"ok": True, "bytes": len(data.encode("utf-8")), "path": str(target), "mode": mode}
 
     # ------------------------------------------------------------ Edit
     @tool("Edit")
@@ -373,12 +421,22 @@ def build_fs_tools(
         失败返回 `{"ok": false, "error_class": ..., ...}`：
         - not_unique：old_string 出现多次（附 occurrences 行号），需加长上下文或传 replace_all
         - no_match：old_string 不存在（附所在文件路径），先用 Read/Grep 核对原文
-        - path_outside_workspace / not_found / is_directory / encoding_error / write_failed
+        - path_outside_workspace / path_read_only / not_found / is_directory /
+          encoding_error / write_failed
         """
         try:
-            target = resolve_in_workspace(path, root)
+            target = resolve_in_roots(path, writable)
         except ValueError as exc:
+            hit = resolve_readonly_hit(path, read_only, base=root)
+            if hit is not None:
+                return tool_error("path_read_only", f"附件目录只读，不能编辑: {hit}", hint=_READONLY_HINT)
             return tool_error("path_outside_workspace", str(exc), hint=_OUTSIDE_HINT)
+        if is_forbidden(target):
+            return tool_error(
+                "path_forbidden",
+                f"目标落在禁区（系统目录），不允许编辑: {target}",
+                hint=_FORBIDDEN_HINT,
+            )
         if not target.exists():
             return tool_error("not_found", f"文件不存在: {target}", hint="用 Glob 确认路径。")
         if target.is_dir():
@@ -431,24 +489,48 @@ def build_fs_tools(
     # ------------------------------------------------------------ DeleteFile
     @tool("DeleteFile")
     def delete_file_tool(paths: list[str] | str) -> dict[str, Any]:
-        """删除工作区内的一个或多个文件。
+        """删除可玩耍区内的一个或多个文件（默认走回收站）。
 
         无状态：只删文件，不删目录、不递归；不存在的路径记为 failed 而不是抛异常。
+        单次最多 10 个（个人文件规则：超过请拆批并逐批确认）。
+        删除优先调用 Windows 回收站；回收站不可用时**拒绝**，不退回永久删除。
 
         入参：
         - paths: 路径列表（也接受单个字符串）
 
         返回：`{"deleted": [绝对路径...], "failed": [{"path": 原始入参, "reason": 稳定错误码}]}`
-        reason ∈ {path_outside_workspace, not_found, is_directory, permission, delete_failed}
+        reason ∈ {path_outside_workspace, path_read_only, path_forbidden, not_found,
+        is_directory, batch_too_large, recycle_unavailable, delete_failed}
         """
         items = [paths] if isinstance(paths, str) else list(paths or [])
+        if len(items) > MAX_BATCH_FILES:
+            return {
+                "deleted": [],
+                "failed": [
+                    {
+                        "path": str(item),
+                        "reason": "batch_too_large",
+                    }
+                    for item in items
+                ],
+                "error_class": "batch_too_large",
+                "hint": f"单次最多删除 {MAX_BATCH_FILES} 个文件；请拆成多批，逐批确认后再继续。",
+            }
         deleted: list[str] = []
         failed: list[dict[str, Any]] = []
         for raw_path in items:
             try:
-                target = resolve_in_workspace(raw_path, root)
+                target = resolve_in_roots(raw_path, writable)
             except ValueError:
-                failed.append({"path": str(raw_path), "reason": "path_outside_workspace"})
+                reason = (
+                    "path_read_only"
+                    if resolve_readonly_hit(raw_path, read_only, base=root) is not None
+                    else "path_outside_workspace"
+                )
+                failed.append({"path": str(raw_path), "reason": reason})
+                continue
+            if is_forbidden(target):
+                failed.append({"path": str(raw_path), "reason": "path_forbidden"})
                 continue
             if not target.exists():
                 failed.append({"path": str(raw_path), "reason": "not_found"})
@@ -456,27 +538,25 @@ def build_fs_tools(
             if target.is_dir():
                 failed.append({"path": str(raw_path), "reason": "is_directory"})
                 continue
-            try:
-                target.unlink()
-            except PermissionError:
-                failed.append({"path": str(raw_path), "reason": "permission"})
-            except OSError:
-                failed.append({"path": str(raw_path), "reason": "delete_failed"})
-            else:
+            ok, reason = move_to_recycle_bin(target)
+            if ok:
                 deleted.append(str(target))
+            else:
+                failed.append({"path": str(raw_path), "reason": reason or "delete_failed"})
         return {"deleted": deleted, "failed": failed}
 
     # ------------------------------------------------------------ Glob
     @tool("Glob")
     def glob_tool(pattern: str, path: str | None = None, limit: int = 200) -> Any:
-        """按 glob 模式查找工作区内的文件，按修改时间新→旧返回。
+        """按 glob 模式查找工作区（或只读附件目录）内的文件，按修改时间新→旧返回。
 
         无状态：每次实时遍历磁盘；结果只含文件，不含目录；
         始终排除 `.git` / `node_modules` / `.venv` / `__pycache__` 目录。
 
         入参：
         - pattern: 相对搜索根的 glob，支持 `**`（如 `**/*.py`、`src/**/test_*.py`）
-        - path: 搜索根（工作区内绝对路径或相对工作区路径）；默认 workspace_root
+        - path: 搜索根（workspace_root / 附件目录内的绝对路径，或相对工作区路径）；
+          默认 workspace_root
         - limit: 最多返回条数（默认 200，硬上限 2000）
 
         返回：`list[str]` 绝对路径，最新修改的在前；
@@ -485,9 +565,10 @@ def build_fs_tools(
         - 参数/路径错误：`{"ok": false, "error_class": ...}`。
         """
         try:
-            search_root = resolve_in_workspace(path, root) if path else root
+            search_root = resolve_in_roots(path, allowed_roots) if path else root
+            base_root = root_of(search_root, allowed_roots)
         except ValueError as exc:
-            return tool_error("path_outside_workspace", str(exc), hint=_OUTSIDE_HINT)
+            return tool_error("path_outside_workspace", str(exc), hint=_READ_HINT)
         if not search_root.exists():
             return tool_error("not_found", f"搜索根不存在: {search_root}", hint="用 workspace_root 或已存在目录。")
         if not search_root.is_dir():
@@ -499,8 +580,8 @@ def build_fs_tools(
         pat = pattern.replace("\\", "/").strip()
         try:
             if Path(pat).is_absolute():
-                abs_pat = resolve_in_workspace(pat, root)
-                pat = abs_pat.relative_to(root).as_posix()
+                abs_pat = resolve_in_roots(pat, allowed_roots)
+                pat = abs_pat.relative_to(base_root).as_posix()
             matches = search_root.glob(pat)
             keep_n = _clamp(limit, 1, MAX_LIMIT) + 1
             heap: list[tuple[float, str]] = []
@@ -511,7 +592,7 @@ def build_fs_tools(
                         continue
                 except OSError:
                     continue
-                if has_excluded_part(item, root):
+                if has_excluded_part(item, base_root):
                     continue
                 total += 1
                 try:
@@ -549,14 +630,14 @@ def build_fs_tools(
         n: bool = True,
         limit: int = 200,
     ) -> Any:
-        """在工作区内按正则搜索文件内容（等价 `grep -rn`，参数名 `n` 即 `-n`）。
+        """在工作区（或只读附件目录）内按正则搜索文件内容（等价 `grep -rn`，参数名 `n` 即 `-n`）。
 
         无状态：每次实时扫描。始终排除 `.git` / `node_modules` / `.venv` / `__pycache__`；
         跳过二进制文件（前 4 KB 含 NUL）与大于 2 MB 的文件；单行最多展示 400 字符。
 
         入参：
         - pattern: Python 正则（re.search 语义）
-        - path: 搜索根（文件或目录；工作区内）；默认 workspace_root
+        - path: 搜索根（文件或目录；工作区或附件目录内）；默认 workspace_root
         - glob: 只搜匹配该 glob 的文件（如 `*.py`，同时匹配相对路径与文件名）
         - n: True 输出 `文件:行号: 内容`；False 输出 `文件: 内容`
         - limit: 最多返回命中行数（默认 200，硬上限 2000）
@@ -578,9 +659,10 @@ def build_fs_tools(
             )
 
         try:
-            target = resolve_in_workspace(path, root) if path else root
+            target = resolve_in_roots(path, allowed_roots) if path else root
+            base_root = root_of(target, allowed_roots)
         except ValueError as exc:
-            return tool_error("path_outside_workspace", str(exc), hint=_OUTSIDE_HINT)
+            return tool_error("path_outside_workspace", str(exc), hint=_READ_HINT)
         if not target.exists():
             return tool_error("not_found", f"搜索路径不存在: {target}", hint="用 Glob 确认路径。")
 
@@ -599,11 +681,11 @@ def build_fs_tools(
         stop = False
 
         for file_path in files:
-            if has_excluded_part(file_path, root):
+            if has_excluded_part(file_path, base_root):
                 continue
             if glob_pat and not (
                 fnmatch.fnmatch(file_path.name, glob_pat)
-                or fnmatch.fnmatch(relative_display(file_path, root), glob_pat)
+                or fnmatch.fnmatch(relative_display(file_path, base_root), glob_pat)
             ):
                 continue
             try:

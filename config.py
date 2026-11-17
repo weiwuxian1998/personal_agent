@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
     feishu_domain: str = "https://open.feishu.cn"
+    # 发文件上限（2026-11 用真实应用凭据实测）：
+    # - im/v1/images：10 MiB 通过、10 MiB+1 报 234006「The file size exceed the max value」；
+    # - im/v1/files ：27,000,000 字节通过、27,500,000 起报 9499/2200，取 25 MiB 留安全边际。
+    # 数字会随平台调整，改这一处即可；提示词只讲"超限了怎么办"。
+    feishu_image_max_bytes: int = 10 * 1024 * 1024
+    feishu_file_max_bytes: int = 25 * 1024 * 1024
 
     # ---------- Redis ----------
     redis_url: str = "redis://127.0.0.1:6379/0"
@@ -50,9 +56,13 @@ class Settings(BaseSettings):
     # 文档 §10.2 的风险：思考模式 + 工具调用需要回传 reasoning_content。
     # v1 先关闭思考作为确定性取舍；真 key 验证后再打开（记录在契约 §14）。
     llm_thinking_disabled: bool = True
+    # 思考档位（OpenAI 兼容的 `reasoning_effort`）；留空 = 请求体不带该字段。
+    # 这是"思考开着但压低档位"的唯一开关，与 llm_thinking_disabled 互斥：
+    # 关闭思考时只发 thinking.type=disabled，不再叠加 reasoning_effort。
+    llm_reasoning_effort: str = "low"
     # 当前模型是否支持 image_url 内容块；False 时由装配层 VisionAdapter 降级为文本。
-    # deepseek-flash 为文本模型，v1 默认 False。
-    llm_supports_vision: bool = False
+    # 主 agent 模型（GLM 系）支持图片理解，默认 True；换纯文本模型时才需要在 .env 关掉。
+    llm_supports_vision: bool = True
 
     # ---------- DeepSeek Web 工具（契约 §7.7） ----------
     # 搜索/抓取专用凭证，**只用于 /v1/tools/search 与 /v1/tools/fetch**。
@@ -76,8 +86,11 @@ class Settings(BaseSettings):
     router_read_block_ms: int = 5000
     batch_debounce_ms: int = 200
     batch_max: int = 10
-    router_recursion_limit: int = 30
-    worker_recursion_limit: int = 40
+    router_recursion_limit: int = 300
+    worker_recursion_limit: int = 300
+    # worker 的 WebSearch 默认值（比 router 更保守，避免工具输出撑爆上下文）
+    worker_web_default_count: int = 3
+    worker_web_content_chars: int = 2048
     # 文档 §7.6：router 绝不跑长命令；worker 可以长跑
     router_shell_timeout_ms: int = 30000
     worker_shell_timeout_ms: int = 600000
@@ -86,6 +99,20 @@ class Settings(BaseSettings):
     tool_output_max_bytes: int = 64 * 1024
     tool_output_head_lines: int = 30
     tool_output_tail_lines: int = 60
+
+    # 文档 §3.6：上下文预算与折叠（router / worker 共用同一组阈值）
+    context_soft_tokens: int = 256_000
+    context_hard_tokens: int = 320_000
+    context_keep_recent_messages: int = 8
+    context_keep_recent_tokens: int = 40_000
+    # 硬预算兜底：窗口内单条 ToolMessage 正文最多保留的字符数
+    context_tool_message_max_chars: int = 4000
+
+    # 文档 §5.6：router → worker 指令通道（worker 侧轮询间隔与积压上限）
+    worker_inbox_poll_s: float = 0.3
+    worker_inbox_max: int = 20
+    # 文档 §5.5：StopCommand 第一级（礼）等待 worker 回写 level=2 的时长
+    stop_graceful_wait_s: float = 2.0
 
     # ---------- supervisor（host 常驻线程） ----------
     schedule_scan_interval_s: int = 5
@@ -98,8 +125,58 @@ class Settings(BaseSettings):
 
     # ---------- 观测 ----------
     log_level: str = "INFO"
+    # 日志轮转（log_rotation.py）：单文件达到阈值就切成 .1…N，旧的删除。
+    # gateway 进程有常驻线程按 check_s 周期扫描；gateway.ps1 start 也会先扫一遍。
+    log_rotate_enabled: bool = True
+    log_rotate_max_bytes: int = 20 * 1024 * 1024
+    log_rotate_backups: int = 5
+    log_rotate_check_s: int = 60
+
+    # ---------- 文件区域（§7.1 / B3）----------
+    # 可玩耍区：读写删全放开的唯一区域。留空 = workspace_root；
+    # 把助手整体搬到 D 盘时配成 `D:\agent`（或 `D:\`），所有工具与 Shell cwd 同步生效。
+    play_root: str = ""
+    # 只读区：默认用户主目录下的 Desktop / Downloads / Documents；可增删（相对名或绝对路径）。
+    # 写/删一律拒绝，只有 Read/Glob/Grep 能进去。
+    readonly_roots: list[str] = []
+
+    # ---------- CUA（§8，纯视觉单屏） ----------
+    # 浏览器内核**唯一**配置点：默认 145；切 158 只改这一行。
+    # 备选：C:\Users\34897\Documents\Trae-CN\temp_20261108_06\cua-browsers\chromium-1254\chrome-win64\chrome.exe
+    cua_browser_exe: str = r"D:\repo\chrome-win64\chrome.exe"
+    # 任务开始前是否自动拉起内核；桌面类任务不需要，默认关。
+    cua_browser_autostart: bool = False
+    # 截图保留窗口（张）：1 = 只有当前一张；越大前后对比视野越长。
+    # 上限由注入层钳制（agents.vision.INJECT_MAX_IMAGES=6），超限按上限钳住并告警。
+    cua_screenshot_window: int = 3
+    # `act` 单批上限：批内不看图，批越长越容易走偏（§8.9.4 建议 3，未验证）。
+    cua_max_batch: int = 3
+    # 单任务物理动作预算（点击/键入/滚动/等待都算），到顶即停。
+    cua_max_actions: int = 100
+    cua_wait_max_ms: int = 5000
 
     # ---------- 派生路径 ----------
+    @property
+    def play_root_path(self) -> Path:
+        """可玩耍区（真实绝对路径）。"""
+        raw = (self.play_root or "").strip()
+        return Path(raw).expanduser().resolve() if raw else self.workspace_root
+
+    @property
+    def readonly_root_paths(self) -> list[Path]:
+        """只读区列表（真实绝对路径）；飞书附件目录由调用方另外追加。"""
+        items = self.readonly_roots or ["Desktop", "Downloads", "Documents"]
+        roots: list[Path] = []
+        for item in items:
+            path = Path(item).expanduser()
+            if not path.is_absolute():
+                path = Path.home() / item
+            try:
+                roots.append(path.resolve())
+            except OSError:
+                roots.append(path.absolute())
+        return roots
+
     @property
     def router_dir(self) -> Path:
         return self.data_dir / "router"
@@ -111,6 +188,16 @@ class Settings(BaseSettings):
     @property
     def tool_outputs_dir(self) -> Path:
         return self.data_dir / "tool_outputs"
+
+    @property
+    def skills_dir(self) -> Path:
+        """技能目录：仓库根下的 `skills/`（不存在时 Skill 工具返回空列表）。"""
+        return Path(__file__).resolve().parent / "skills"
+
+    @property
+    def inbox_dir(self) -> Path:
+        """飞书图片/文件的落盘目录（§6.2，gateway 侧使用）。"""
+        return self.data_dir / "inbox"
 
     @property
     def workers_dir(self) -> Path:
@@ -133,6 +220,7 @@ class Settings(BaseSettings):
             self.router_dir,
             self.memory_dir,
             self.tool_outputs_dir,
+            self.inbox_dir,
             self.workers_dir,
             self.db_path.parent,
             self.logs_dir,

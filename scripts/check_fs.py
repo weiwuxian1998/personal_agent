@@ -7,6 +7,7 @@
 - Write/Read 往返（UTF-8、CRLF 保真、嵌套目录自动创建）；
 - Read 的 offset/limit、越界 offset、大文件落盘 stub、二进制拒绝、目录拒绝；
 - Read 图片：多模态内容块 + data URI 可还原、as_=text、超大图片拒绝；
+- 只读白名单（飞书附件目录）：Read/Glob/Grep 放行，Write/Edit/DeleteFile 返回 path_read_only；
 - Edit：唯一匹配、无匹配、多处匹配（not_unique）、replace_all；
 - DeleteFile：部分成功、缺失、目录、越界；
 - 工作区越界（`../`、绝对外部路径、同前缀兄弟目录、符号链接）：读写删/Glob/Grep 全线拦截；
@@ -328,15 +329,73 @@ def main() -> int:
     (img_dir / "dot.png").write_bytes(png)
     res = read.invoke({"path": "img/dot.png"})
     check(
-        "Read 图片返回内容块列表",
-        isinstance(res, list) and len(res) == 2 and res[1].get("type") == "image_url",
-        res if not isinstance(res, list) else [b.get("type") for b in res],
+        "Read 图片只回引用文本（不内联 base64）",
+        isinstance(res, list)
+        and len(res) == 1
+        and res[0].get("type") == "text"
+        and res[0]["text"].startswith("[图片] ")
+        and "base64" not in res[0]["text"],
+        res,
     )
-    data_uri = res[1]["image_url"]["url"] if isinstance(res, list) and len(res) == 2 else ""
-    check("Read 图片为 data URI", data_uri.startswith("data:image/png;base64,"), data_uri[:40])
+    # 引用 → 请求时还原：图片以独立 user 消息追加（端点限制：tool 消息带图 400）
+    from types import SimpleNamespace as _NS
+
+    from agents.vision import inject_image_blocks as _inject
+
+    injected = _inject([_NS(content=list(res))])
+    img_blocks = [
+        b
+        for b in (getattr(injected[-1], "content", None) or [])
+        if isinstance(b, dict) and b.get("type") == "image_url"
+    ]
+    ok_inject = (
+        len(injected) == 2
+        and len(img_blocks) == 1
+        and img_blocks[0]["image_url"]["url"].startswith("data:image/png;base64,")
+        and base64.b64decode(img_blocks[0]["image_url"]["url"].split(",", 1)[1]) == png
+    )
+    check("Read 图片引用在请求时还原为 user 消息里的 image_url 且字节一致", ok_inject, str(injected[-1].content)[:120])
+
+    # BMP 不在端点支持列表（仅 JPEG/PNG/GIF/WebP）：注入时应自动转码为 PNG
+    from PIL import Image as _Image
+    import io as _io
+
+    _bmp_buf = _io.BytesIO()
+    _Image.new("RGB", (4, 4), (255, 0, 0)).save(_bmp_buf, format="BMP")
+    (img_dir / "dot.bmp").write_bytes(_bmp_buf.getvalue())
+    res = read.invoke({"path": "img/dot.bmp"})
+    injected = _inject([_NS(content=list(res))])
+    img_blocks = [
+        b
+        for b in (getattr(injected[-1], "content", None) or [])
+        if isinstance(b, dict) and b.get("type") == "image_url"
+    ]
     check(
-        "Read 图片 data URI 可还原原始字节",
-        base64.b64decode(data_uri.split(",", 1)[1]) == png if data_uri else False,
+        "Read BMP 引用注入时转码为端点支持格式（非 image/bmp 且可解码）",
+        len(injected) == 2
+        and len(img_blocks) == 1
+        and img_blocks[0]["image_url"]["url"].startswith("data:image/")
+        and not img_blocks[0]["image_url"]["url"].startswith("data:image/bmp")
+        and _Image.open(_io.BytesIO(base64.b64decode(img_blocks[0]["image_url"]["url"].split(",", 1)[1]))) is not None,
+        img_blocks[0]["image_url"]["url"][:40] if img_blocks else str(injected[-1].content)[:120],
+    )
+
+    # 数量上限：从最新引用往前数、按路径去重，最多 INJECT_MAX_IMAGES 张
+    from agents.vision import INJECT_MAX_IMAGES as _MAXI
+
+    cap_msgs: list = []
+    for i in range(_MAXI + 3):
+        (img_dir / f"cap_{i}.png").write_bytes(png)
+        ref = read.invoke({"path": f"img/cap_{i}.png"})[0]["text"]
+        cap_msgs.append(_NS(content=[{"type": "text", "text": ref}]))
+    injected = _inject(cap_msgs)
+    n_imgs = sum(
+        1 for b in (getattr(injected[-1], "content", None) or []) if isinstance(b, dict) and b.get("type") == "image_url"
+    )
+    check(
+        f"图片注入数量上限（最新 {_MAXI} 张优先，其余保持文本）",
+        len(injected) == len(cap_msgs) + 1 and n_imgs == _MAXI,
+        f"{n_imgs}/{_MAXI}",
     )
     res = read.invoke({"path": "img/dot.png", "as_": "text"})
     check(
@@ -349,6 +408,77 @@ def main() -> int:
     check(
         "Read 超大图片返回 image_too_large",
         isinstance(res, dict) and res.get("error_class") == "image_too_large",
+        res,
+    )
+
+    # ---------------------------------------------------------------- 只读白名单（飞书附件）
+    inbox = base / "inbox"
+    inbox.mkdir()
+    (inbox / "img_abc.png").write_bytes(png)
+    (inbox / "报告.txt").write_text("附件正文\n", encoding="utf-8", newline="\n")
+    guarded = build_fs_tools(workspace_root=ws, tool_outputs_dir=outputs, read_roots=[inbox])
+    g_read, g_write, g_edit, g_delete, g_glob, g_grep = guarded
+
+    res = g_read.invoke({"path": str(inbox / "报告.txt")})
+    check("只读白名单 Read 可读附件文本", res == "附件正文\n", res)
+    res = g_read.invoke({"path": str(inbox / "img_abc.png")})
+    check(
+        "只读白名单 Read 图片同样只回引用文本",
+        isinstance(res, list)
+        and len(res) == 1
+        and res[0].get("type") == "text"
+        and res[0]["text"].startswith("[图片] ")
+        and "base64" not in res[0]["text"],
+        str(res)[:120],
+    )
+
+    res = g_write.invoke({"path": str(inbox / "new.txt"), "content": "x"})
+    check(
+        "Write 落附件目录返回 path_read_only 且带 hint",
+        isinstance(res, dict)
+        and res.get("error_class") == "path_read_only"
+        and res.get("hint"),
+        res,
+    )
+    check("Write 没有写进附件目录", not (inbox / "new.txt").exists())
+    res = g_write.invoke({"path": "..\\inbox\\escape.txt", "content": "x"})
+    check(
+        "Write 用 .. 摸进附件目录也返回 path_read_only",
+        isinstance(res, dict) and res.get("error_class") == "path_read_only",
+        res,
+    )
+    res = g_edit.invoke({"path": str(inbox / "报告.txt"), "old_string": "附件", "new_string": "x"})
+    check(
+        "Edit 附件返回 path_read_only",
+        isinstance(res, dict) and res.get("error_class") == "path_read_only",
+        res,
+    )
+    res = g_delete.invoke({"paths": [str(inbox / "报告.txt")]})
+    check(
+        "DeleteFile 附件返回 path_read_only",
+        isinstance(res, dict) and res.get("failed", [{}])[0].get("reason") == "path_read_only",
+        res,
+    )
+    check("附件文件未被删除", (inbox / "报告.txt").exists())
+
+    res = g_glob.invoke({"pattern": "*.txt", "path": str(inbox)})
+    check(
+        "只读白名单 Glob 可列附件",
+        isinstance(res, list) and any(str(p).endswith("报告.txt") for p in res),
+        res,
+    )
+    res = g_glob.invoke({"pattern": "**/*.png"})
+    check(
+        "Glob 默认仍只搜 workspace_root（不主动扫附件目录）",
+        isinstance(res, list) and all(str(inbox) not in str(p) for p in res),
+        res,
+    )
+    res = g_grep.invoke({"pattern": "附件正文", "path": str(inbox)})
+    check("只读白名单 Grep 可搜附件", isinstance(res, str) and "报告.txt" in res, res)
+    res = g_read.invoke({"path": str(outside)})
+    check(
+        "只读白名单不影响其它越界拦截",
+        isinstance(res, dict) and res.get("error_class") == "path_outside_workspace",
         res,
     )
 

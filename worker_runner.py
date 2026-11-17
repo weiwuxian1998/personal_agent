@@ -19,8 +19,9 @@ from pathlib import Path
 
 import redis
 
-from agents.base import last_ai_text
+from agents.base import last_ai_text, stream_agent_steps
 from agents.context import current_task_id, current_trace_id
+from agents.worker.control import WorkerControl
 from agents.worker.graph import build_worker
 from bus.envelope import ROUTER_STREAM, ROUTER_STREAM_MAXLEN, new_event
 from bus.stream import Bus
@@ -39,6 +40,9 @@ def _setup_logging() -> None:
         format="%(asctime)s %(levelname)s [worker] %(message)s",
         stream=sys.stdout,
     )
+    # HTTP 客户端的逐请求 INFO 噪音降级；模型/工具的关键过程由 stream_agent_steps 落日志。
+    for noisy in ("httpx", "httpcore", "openai", "langchain_openai"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def _session_id(task_id: str) -> str:
@@ -52,36 +56,100 @@ def _load_task(task_id: str) -> TaskSpec:
     return TaskSpec.from_json(path.read_text(encoding="utf-8"))
 
 
-def _run_agent(task: TaskSpec, *, checkpointer) -> str:
-    graph = build_worker(task=task, settings=settings, checkpointer=checkpointer)
-    result = graph.invoke(
+def _run_agent(
+    task: TaskSpec,
+    *,
+    checkpointer,
+    control: WorkerControl | None = None,
+    redis_client: redis.Redis | None = None,
+    on_round: Any = None,
+) -> str:
+    graph = build_worker(
+        task=task,
+        settings=settings,
+        checkpointer=checkpointer,
+        control=control,
+        redis_client=redis_client,
+        on_round=on_round,
+    )
+    # stream 而非 invoke：模型思考、工具调用及结果逐步实时落日志，任务失败时日志里有现场。
+    messages = stream_agent_steps(
+        graph,
         {"messages": [{"role": "user", "content": task.prompt}]},
         {
             "configurable": {"thread_id": f"worker:{task.task_id}"},
             "recursion_limit": settings.worker_recursion_limit,
         },
+        logger=logger,
     )
-    text = last_ai_text(result.get("messages") or [])
+    text = last_ai_text(messages)
     if not text:
         text = "（worker 没有产出文本结论：可能是模型只发了工具调用，或输出为空）"
     return text
 
 
-def _publish(redis_client: redis.Redis, task: TaskSpec, *, text: str, status: str) -> None:
+def _error_summary(exc: BaseException) -> str:
+    """失败原因的稳定摘要：异常类名 + 消息。
+
+    不能只取 traceback 最后一行——`GraphRecursionError` 的 traceback 末尾是
+    "For troubleshooting, visit: https://..."，真正的原因行会被丢掉。
+    """
+    message = str(exc).strip() or "(no message)"
+    return f"{type(exc).__name__}: {message}"
+
+
+def _publish(
+    redis_client: redis.Redis,
+    task: TaskSpec,
+    *,
+    text: str,
+    status: str,
+    error: str = "",
+    result_path: str = "",
+) -> None:
     bus = Bus(redis_client)
-    event = new_event(
-        "worker_result",
-        "worker",
-        {
-            "task_id": task.task_id,
-            "session_id": _session_id(task.task_id),
-            "title": task.title,
-            "status": status,
-            "text": text,
-        },
-        trace_id=task.trace_id,
-    )
+    payload = {
+        "task_id": task.task_id,
+        "session_id": _session_id(task.task_id),
+        "title": task.title,
+        "status": status,
+        "text": text,
+        # 会话归属由 task.json 固化，router 用它设置 current_chat_id，
+        # 不再依赖全局 last_chat_id（多会话时会发错人）。
+        "chat_id": task.chat_id,
+        # router 靠它识别「记忆整理完成」，回写 consolidated 记账。
+        "task_kind": task.task_kind,
+        # result.json 的绝对路径：digest 里正文被截断时，router 可用 Read 读全文对账。
+        "result_path": result_path,
+    }
+    if error:
+        payload["error"] = error
+    event = new_event("worker_result", "worker", payload, trace_id=task.trace_id)
     bus.xadd(event, stream=ROUTER_STREAM, maxlen=ROUTER_STREAM_MAXLEN)
+
+
+def _write_result(
+    workers_dir: Path,
+    task_id: str,
+    *,
+    status: str,
+    text: str,
+    error: str = "",
+) -> str:
+    """写 `workers/<task_id>/result.json`；失败时 `error` 必须是 `类名: 消息`。
+
+    返回落盘的绝对路径，随 `worker_result` 事件的 `result_path` 字段带给 router。
+    """
+    payload: dict[str, str] = {"status": status, "text": text}
+    if error:
+        payload["error"] = error
+    try:
+        target = Path(workers_dir) / task_id / "result.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(target.resolve())
+    except Exception as e:
+        return f"result.json保存失败 {str(e)}"
 
 
 def main() -> int:
@@ -102,6 +170,23 @@ def main() -> int:
     current_task_id.set(task.task_id)
     logger.info("开始任务 task=%s title=%s", task.task_id, task.title)
 
+    # CUA：环境准备（启动内核）不是模型工具，由运行时按配置执行；只关闭本次拉起的实例。
+    browser_state: dict | None = None
+    if task.task_kind == "cua" and settings.cua_browser_autostart:
+        try:
+            from cua.browser import ensure_browser
+
+            browser_state = ensure_browser(settings)
+            logger.info("CUA 浏览器内核：%s", {k: v for k, v in browser_state.items() if k != "proc"})
+        except Exception:
+            logger.warning("启动 CUA 浏览器失败（继续执行，模型可操作现有桌面）\n%s", traceback.format_exc())
+
+    def _stop_cua_browser() -> None:
+        if browser_state:
+            from cua.browser import stop_browser
+
+            stop_browser(browser_state)
+
     redis_client = redis.from_url(
         settings.redis_url,
         decode_responses=True,
@@ -111,7 +196,17 @@ def main() -> int:
     store.init_schema()
     session_id = _session_id(task.task_id)
 
+    # 指令/停止通道：后台线程消费 worker 自己的 stream + 轮询 stop_key。
+    control = WorkerControl(
+        redis_client=redis_client,
+        task_id=task.task_id,
+        poll_interval_s=settings.worker_inbox_poll_s,
+        inbox_max=settings.worker_inbox_max,
+    )
+    control.start()
+
     text = ""
+    error = ""
     status = "done"
     exit_code = 0
     try:
@@ -133,30 +228,38 @@ def main() -> int:
             saver = None
 
         try:
-            text = _run_agent(task, checkpointer=saver)
+            text = _run_agent(
+                task,
+                checkpointer=saver,
+                control=control,
+                redis_client=redis_client,
+                on_round=lambda: store.touch_session(session_id),
+            )
         finally:
             if checkpointer_ctx is not None:
                 checkpointer_ctx.__exit__(None, None, None)
-    except Exception:
+            control.close()
+    except Exception as exc:
+        control.close()
         status = "error"
         exit_code = 1
         detail = traceback.format_exc(limit=8)
         logger.error("任务失败\n%s", detail)
-        text = f"任务执行失败（worker 进程内异常）：\n{detail.strip().splitlines()[-1]}"
+        error = _error_summary(exc)
+        text = f"任务执行失败（worker 进程内异常）：\n{error}"
 
     try:
-        (settings.workers_dir / task.task_id / "result.json").write_text(
-            json.dumps({"status": status, "text": text}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        _publish(redis_client, task, text=text, status=status)
+        result_path = _write_result(settings.workers_dir, task.task_id, status=status, text=text, error=error)
+        _publish(redis_client, task, text=text, status=status, error=error, result_path=result_path)
         store.set_status(session_id, status)
         store.set_first_message_at(session_id)
         logger.info("任务结束 task=%s status=%s 结果长度=%d", task.task_id, status, len(text))
     except Exception:
         logger.error("回传 worker_result 失败（router 将收不到结果）\n%s", traceback.format_exc())
+        _stop_cua_browser()
         return 3
 
+    _stop_cua_browser()
     return exit_code
 
 

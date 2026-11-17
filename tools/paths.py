@@ -76,6 +76,59 @@ def relative_display(path: str | Path, root: str | Path) -> str:
     return rel.as_posix()
 
 
+def resolve_in_roots(path: str | Path, roots: list[str | Path]) -> Path:
+    """在「工作区 + 只读白名单」里解析路径，任一命中即返回。
+
+    相对路径按第一个 root（工作区）解析；绝对路径依次尝试各个 root。
+    全部越界时抛 `PathOutsideWorkspace`。
+    """
+    last: ValueError | None = None
+    for root in roots:
+        try:
+            return resolve_in_workspace(path, root)
+        except PathOutsideWorkspace as exc:
+            last = exc
+    raise last or PathOutsideWorkspace(f"路径越界: {path}")
+
+
+def root_of(path: str | Path, roots: list[str | Path]) -> Path:
+    """返回 `path` 所属的 root（用于排除目录判断/相对展示）；找不到时返回第一个。"""
+    resolved = Path(path).expanduser()
+    try:
+        resolved = resolved.resolve()
+    except OSError:
+        pass
+    for root in roots:
+        root_path = Path(root).expanduser().resolve()
+        if is_within(resolved, root_path):
+            return root_path
+    return Path(roots[0]).expanduser().resolve()
+
+
+def resolve_readonly_hit(
+    path: str | Path,
+    read_roots: list[str | Path],
+    *,
+    base: str | Path | None = None,
+) -> Path | None:
+    """写工具用：路径落在只读白名单里时返回解析后的路径，否则 None。
+
+    相对路径按 `base`（通常是 workspace_root）解析，防止用 `..` 摸进附件目录。
+    """
+    if not read_roots:
+        return None
+    raw = Path(str(path)).expanduser()
+    candidate = raw if raw.is_absolute() else (Path(base).expanduser() / raw if base else raw.resolve())
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    for root in read_roots:
+        if is_within(resolved, Path(root).expanduser().resolve()):
+            return resolved
+    return None
+
+
 def has_excluded_part(path: str | Path, root: str | Path) -> bool:
     """路径（相对工作区）的任一段命中排除目录名时返回 True。"""
     try:

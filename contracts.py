@@ -46,7 +46,7 @@ EVENT_SOURCES: frozenset[str] = frozenset(
 
 ToolProfile = Literal["router", "worker"]
 SessionStatus = Literal["running", "waiting_router", "idle", "stopped", "error", "done", "unreachable"]
-TaskKind = Literal["general", "memory_consolidate"]
+TaskKind = Literal["general", "memory_consolidate", "cua"]
 
 _ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -154,6 +154,7 @@ class IncomingMessage:
     text: str
     create_time: int        # 平台侧毫秒时间戳；0 表示未知
     thread_id: Optional[str] = None
+    attachments: list[str] = field(default_factory=list)  # 已落盘的附件绝对路径（按消息内顺序）
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -182,9 +183,11 @@ class SessionRecord:
     created_at: str = ""
     updated_at: str = ""
     first_message_at: Optional[str] = None  # NULL = 派发后尚未收到任何 worker 消息
+    last_seen: Optional[str] = None         # worker 每轮模型调用写一次（巡检停滞判据）
 
     @classmethod
     def from_row(cls, row: Any) -> "SessionRecord":
+        keys = row.keys() if hasattr(row, "keys") else []
         return cls(
             id=row["id"],
             title=row["title"],
@@ -196,6 +199,7 @@ class SessionRecord:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             first_message_at=row["first_message_at"],
+            last_seen=row["last_seen"] if "last_seen" in keys else None,
         )
 
 
@@ -247,6 +251,7 @@ class TaskSpec:
     trace_id: str
     cwd: str
     workspace_root: str
+    chat_id: str = ""          # 派发时的会话；worker_result 带回，router 据此回复正确会话
     tools_profile: ToolProfile = "worker"
     task_kind: TaskKind = "general"
     resume: bool = False

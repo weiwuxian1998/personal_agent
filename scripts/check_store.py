@@ -221,6 +221,64 @@ def check_jsonl(tmp: Path) -> None:
     check("jsonl_read_since", [r["seq"] for r in read_records(directory, since_seq=2)] == [3])
     check("jsonl_read_limit", len(list(read_records(directory, limit=2))) == 2)
 
+    # compact / consolidated 记账（设计 §3.2）：只追加、seq 连续、covers_seq 可回读
+    from memory import ledger  # noqa: E402
+
+    compact_seq = ledger.append_compact(
+        directory,
+        reason="budget_soft_256k",
+        boundary_checkpoint_id="msg-42",
+        removed_messages=6,
+        tokens_before=300_000,
+        tokens_after=20_000,
+        upto_seq=3,
+        summary_ref="memory/summary.md#v1",
+    )
+    check("jsonl_compact_seq", compact_seq == 4, str(compact_seq))
+    consolidated_seq = ledger.append_consolidated(
+        directory,
+        task_id="01MEMTASK",
+        covers_seq=[1, 3],
+        summary_ref="memory/summary.md#v1",
+        summary_version=1,
+        facts_written=2,
+        decisions_written=1,
+    )
+    check("jsonl_consolidated_seq", consolidated_seq == 5, str(consolidated_seq))
+
+    all_records = list(read_records(directory))
+    check("jsonl_meta_seq_continuous", [r["seq"] for r in all_records] == [1, 2, 3, 4, 5])
+    compact = next(r for r in all_records if r.get("type") == "compact")
+    check(
+        "jsonl_compact_fields",
+        compact["covers_seq"] == [1, 3]
+        and compact["boundary_checkpoint_id"] == "msg-42"
+        and compact["reason"] == "budget_soft_256k"
+        and compact["summary_ref"] == "memory/summary.md#v1",
+        str(compact),
+    )
+    check("jsonl_meta_append_only", len(path.read_text(encoding="utf-8").splitlines()) == 5)
+
+    # 回读通道：默认跳过元记录，可按关键词 / 时间 / seq 过滤
+    check(
+        "jsonl_read_skips_meta",
+        [r["seq"] for r in ledger.query_records(directory)] == [1, 2, 3],
+    )
+    check(
+        "jsonl_read_keyword",
+        [r["seq"] for r in ledger.query_records(directory, keyword="第二")] == [2],
+    )
+    check(
+        "jsonl_read_seq_range",
+        [r["seq"] for r in ledger.query_records(directory, since_seq=2, until_seq=3)] == [2, 3],
+    )
+    check("jsonl_read_meta_optin", len(ledger.query_records(directory, include_meta=True)) == 5)
+    check("jsonl_read_time_future_empty", ledger.query_records(directory, since_ts="2999-01-01") == [])
+    check("jsonl_compact_cursor", ledger.last_compact_cursor(directory) == 3)
+    check("jsonl_consolidated_cursor", ledger.last_consolidated_seq(directory) == 3)
+    check("jsonl_pending_turns_zero", ledger.count_turns_after(directory, 3) == 0)
+    check("jsonl_pending_turns_all", ledger.count_turns_after(directory, 0) == 3)
+
 
 # ----------------------------------------------------------------------------- Redis
 def check_redis() -> None:

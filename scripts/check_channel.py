@@ -28,7 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from channel.base import Channel  # noqa: E402
+from channel.base import Channel, format_query_time, wrap_user_query  # noqa: E402
 from channel.console import ConsoleChannel  # noqa: E402
 from contracts import IncomingMessage, SendResult, ulid  # noqa: E402
 
@@ -233,7 +233,14 @@ def t_console_channel() -> str:
     assert all(m.channel == "console" and m.chat_id == "console" for m in received)
     assert all(m.chat_type == "p2p" and m.create_time > 0 for m in received)
     assert received[0].message_id != received[1].message_id, "console message_id 必须唯一"
-    return "stdout 发送 + stdin 接收（空行跳过、/quit 退出）"
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        image = channel.send_image(chat_id="console", path="D:/tmp/a.png")
+        file = channel.send_file(chat_id="console", path="D:/tmp/a.pdf", name="周报.pdf")
+    assert image.ok and file.ok, f"console 附件发送异常: {image} / {file}"
+    assert channel.sent[-2]["kind"] == "image" and channel.sent[-2]["path"] == "D:/tmp/a.png"
+    assert channel.sent[-1]["kind"] == "file" and channel.sent[-1]["path"] == "D:/tmp/a.pdf"
+    return "stdout 发送 + stdin 接收（空行跳过、/quit 退出）+ 附件记录"
 
 
 # --------------------------------------------------------------- 3. 飞书单聊事件解析
@@ -350,6 +357,89 @@ def t_parse_filters() -> str:
     )
     assert len(received) == 1, "sender_type=None 应按普通用户消息处理"
     return "机器人消息 / 图片 / 坏 JSON / 空白文本 全部过滤；sender_type=None 放行"
+
+
+# ------------------------------------------------------------------ 图片 / 文件落盘
+def t_parse_attachments() -> str:
+    import tempfile
+
+    inbox = tempfile.mkdtemp(prefix="check-inbox-")
+    channel = FeishuChannel("cli_check_fake", "fake_secret_value", inbox_dir=inbox)
+
+    def _event_obj(message_type: str, content: str, message_id: str):
+        return types.SimpleNamespace(
+            event=types.SimpleNamespace(
+                sender=types.SimpleNamespace(
+                    sender_type="user",
+                    sender_id=types.SimpleNamespace(open_id="ou_x"),
+                ),
+                message=types.SimpleNamespace(
+                    message_id=message_id,
+                    message_type=message_type,
+                    content=content,
+                    chat_id="oc_x",
+                    chat_type="p2p",
+                    create_time="1760000000000",
+                    thread_id=None,
+                    mentions=None,
+                ),
+            ),
+            header=types.SimpleNamespace(event_id="evt_x", create_time="1760000000100"),
+        )
+
+    image_event = _event_obj("image", json.dumps({"image_key": "img_check"}), "om_img_ok")
+    expected = str(Path(inbox) / "fake.png")
+    parsed = parse_p2_message(
+        image_event,
+        download=lambda message_id, key, kind, name="": expected,
+    )
+    assert parsed is not None, "图片消息被丢弃"
+    assert expected in parsed.text, f"图片路径没写进文本: {parsed.text!r}"
+    assert parsed.attachments == [expected], f"attachments 没带回路径: {parsed.attachments!r}"
+    assert parsed.raw.get("attachment") == expected
+
+    file_event = _event_obj(
+        "file",
+        json.dumps({"file_key": "file_key_x", "file_name": "报告.pdf"}),
+        "om_file_ok",
+    )
+    file_parsed = parse_p2_message(
+        file_event,
+        download=lambda message_id, key, kind, name="": str(Path(inbox) / "fake.pdf"),
+    )
+    assert file_parsed is not None and "报告.pdf" in file_parsed.text
+
+    # 没有下载器 / 下载失败 → 与旧行为一致：丢弃，不影响文本链路
+    assert parse_p2_message(image_event) is None
+    assert parse_p2_message(image_event, download=lambda *a, **k: "") is None
+
+    # _fetch_attachment：API 成功时写盘并返回路径
+    class _FakeResponse:
+        code, msg = 0, "ok"
+
+        def __init__(self) -> None:
+            import io
+
+            self.file = io.BytesIO(b"\x89PNG\r\n")
+
+        def success(self) -> bool:
+            return True
+
+    class _FakeResource:
+        def get(self, request):
+            return _FakeResponse()
+
+    class _FakeV1:
+        message_resource = _FakeResource()
+
+    class _FakeApi:
+        im = types.SimpleNamespace(v1=_FakeV1())
+
+    channel._api = _FakeApi()
+    saved = channel._fetch_attachment("om_x", "img_key", "image", "x.png")
+    assert saved and Path(saved).exists() and Path(saved).read_bytes() == b"\x89PNG\r\n"
+    Path(saved).unlink()
+    return "图片/文件解析为本地路径；下载器写盘；无下载器时安全丢弃"
 
 
 # ------------------------------------------------------------------- 6. 去重
@@ -514,6 +604,40 @@ def t_live_send() -> str:
 
 
 # --------------------------------------------------------------------------- 主流程
+# --------------------------------------------------------------------------- 用户输入包装
+def t_wrap_user_query() -> str:
+    from datetime import datetime  # noqa: PLC0415
+
+    from contracts import TZ_SHANGHAI  # noqa: PLC0415
+
+    ms = int(datetime(2026, 11, 9, 21, 30, 12, tzinfo=TZ_SHANGHAI).timestamp() * 1000)
+    got = wrap_user_query("21:30 提醒我开会", ms)
+    assert got == (
+        "<user_query>21:30 提醒我开会</user_query>"
+        "<query_time>2026-11-09T21:30:12+08:00</query_time>"
+    ), got
+    assert format_query_time(ms) == "2026-11-09T21:30:12+08:00"
+
+    # 缺失/非法时间退回当前时刻，仍然必须带 +08:00
+    for bad in (0, None, "not-a-time"):
+        wrapped = wrap_user_query("x", bad)  # type: ignore[arg-type]
+        assert wrapped.startswith("<user_query>x</user_query><query_time>"), wrapped
+        assert wrapped.endswith("+08:00</query_time>"), wrapped
+
+    # 原话不转义、不改写
+    raw = "看这个 <b>不要改</b> & 保留空格"
+    assert f"<user_query>{raw}</user_query>" in wrap_user_query(raw, ms)
+
+    # 附件按顺序各一条
+    paths = [r"C:\inbox\a.png", r"D:\work\报告.pdf"]
+    wrapped = wrap_user_query("看图", ms, paths)
+    assert wrapped.endswith(
+        r'<attachment path="C:\inbox\a.png"/><attachment path="D:\work\报告.pdf"/>'
+    ), wrapped
+    assert wrapped.count("<attachment ") == 2
+    return "原话 + UTC+8 时间 + 按顺序的附件路径；非法时间退回当前时刻"
+
+
 def main() -> int:
     print("=" * 72)
     print("M-CHANNEL 验收（飞书渠道；默认不访问网络、不发真实消息）")
@@ -527,6 +651,8 @@ def main() -> int:
     check("3. 飞书单聊事件解析", t_parse_p2p)
     check("4. 群聊 @ 清洗", t_parse_group_mentions)
     check("5. 机器人自身消息 / 非文本 / 坏内容过滤", t_parse_filters)
+    check("5b. 图片/文件落盘与解析", t_parse_attachments)
+    check("5c. 用户输入固定包装（时间戳/附件）", t_wrap_user_query)
     check("6. 事件去重（含失败后重试）", t_dedupe)
     check("7. 文本分段", t_split_text)
     check("8. 发送成功与自动分段", t_send_success)

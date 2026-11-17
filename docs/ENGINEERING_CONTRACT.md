@@ -472,16 +472,17 @@ def adapt_messages(messages, *, supports_vision: bool, placeholder: str = ...) -
 #### `tools/reply.py`（B1，唯一用户出口）
 
 ```python
-def build_reply_user_tool(*, channel: Channel, redis_client,
+def build_reply_user_tool(*, bus: Bus, redis_client,
                           ttl_s: int = 86400) -> BaseTool
 ```
 
 `ReplyUser(text, reply_to=None, quote=False, idempotency_key=None) -> dict`
 
 - `chat_id` 不在入参里：从 runtime context 取 `current_chat_id`（见 §8.4），没有则从 Redis `asst:router:state` 的 `last_chat_id` 取；仍没有返回 `error_class="no_chat_id"`；
-- 幂等：`SET NX asst:reply:idem:<trace_id>:<reply_index>`；命中则返回旧 `message_id`；
-- 返回 `{"ok":bool,"message_id":str,"error":str}`；
-- **全仓库只允许这一个文件 import `channel.send_text`**（worker 无法触达）。
+- 幂等：`SET NX asst:reply:idem:<trace_id>:<reply_index>`；命中则返回旧 `message_id`（仍在排队时返回 `pending`）；
+- **不直接调渠道**：写一条 `router_message`（`kind=reply`，含 `chat_id/text/reply_to/idem_slot`）到 `asst:stream:outbox`，返回 `{"ok":True,"queued":true,"chat_id":str,"slot":str}`；入队失败删幂等键并返回 `error_class="enqueue_failed"`；
+- 真正发送由 gateway 的 `OutboxSender` 完成（§9.1.1）。**router 进程禁止 import `channel.*` / `lark_oapi`**
+  （已加断言 `router_startup_no_lark_subprocess`、`router_import_graph_no_channel`）。
 
 #### `tools/schedule.py`（B1）
 
@@ -854,6 +855,25 @@ def build_worker(task: TaskSpec, settings, checkpointer, redis_client) -> Compil
   由 gateway 的 supervisor 负责有限次重试，见 9.3）；
 - `ReplyUser` 幂等键 `trace_id + ":" + reply_index`；
 - 退出前必须满足 `lag()==0`，否则可能漏掉刚到达、尚未投递的事件（已实测）。
+
+#### 9.1.1 发送分离：router → outbox → gateway
+
+router **不构造渠道**（`build_channel` 只在 gateway 调用），因此冷启动不会
+`import lark_oapi`（实测省 47–51s）。链路：
+
+```
+ReplyUser → XADD asst:stream:outbox（type=router_message, kind=reply）
+          → gateway OutboxSender XREADGROUP（block=500ms，新条目立即唤醒）
+          → channel.send_text → 飞书 OpenAPI
+          → SET <reply:idem> <message_id> XX（回填幂等键）
+          → XACK outbox
+```
+
+- 发送失败重试 3 次（0.3s/0.6s 退避）；仍失败则删除幂等键，并向 `asst:stream:router`
+  写一条 `system` 事件（`kind=send_failed`，含 `chat_id/error/code/text_preview`），
+  由 router 下一轮告知用户；outbox 条目 ACK，不会无限重试；
+- gateway 重启后 outbox 从 `id=0` 重放，幂等键已是 `message_id` 的条目直接跳过（至少一次、至多一次效果）；
+- `asst:stream:outbox`（group `gateway-sender`，consumer `gateway-1`，MAXLEN~1000）。
 
 ### 9.2 worker 生命周期
 

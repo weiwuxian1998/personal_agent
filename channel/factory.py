@@ -1,8 +1,12 @@
-"""按配置构造渠道实例（gateway 与 router 共用同一套选择逻辑）。
+"""按配置构造渠道实例（只由 gateway 使用）。
 
-为什么需要这个文件：gateway 需要 `run_forever` 收消息，router 需要 `send_text`
-发消息，两边必须选中**同一种**渠道；如果把选择散落在两个入口脚本里，
-`channel_kind` 与命令行参数的优先级就会出现两份实现。
+为什么需要这个文件：gateway 需要 `run_forever` 收消息，也需要 `send_text`
+发送 router 写入 outbox 的回复；选中哪一种渠道只在这里实现一次，
+避免 `channel_kind` 与命令行参数的优先级出现两份实现。
+
+**router 进程不构造渠道**（契约 §9.1）：ReplyUser 只写 outbox Stream，
+由 gateway 的 OutboxSender 调 `send_text`。因此 router 冷启动不会
+`import lark_oapi`（实测该导入 47–51s）。
 
 注意：`lark_oapi` 的导入非常慢（会加载几千个 API 模型模块，实测数十秒）。
 因此这里**不在模块顶层导入 `channel.feishu`**，只在真正选择飞书渠道时才导入；
@@ -34,5 +38,8 @@ def build_channel(settings: Settings) -> "Channel":
             settings.feishu_app_id,
             settings.feishu_app_secret,
             settings.feishu_domain,
+            inbox_dir=str(settings.inbox_dir),
+            image_max_bytes=settings.feishu_image_max_bytes,
+            file_max_bytes=settings.feishu_file_max_bytes,
         )
     raise ValueError(f"未知 channel_kind: {settings.channel_kind!r}（支持 feishu/console）")

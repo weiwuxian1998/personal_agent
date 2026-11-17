@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -19,22 +20,34 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import redis
 
 from bus.envelope import (
+    OUTBOX_CONSUMER,
+    OUTBOX_GROUP,
+    OUTBOX_STREAM,
+    REPLY_IDEM_PREFIX,
     ROUTER_HEARTBEAT_KEY,
     ROUTER_SPAWNING_KEY,
     ROUTER_STREAM,
+    ROUTER_STREAM_MAXLEN,
+    event_from_redis,
+    event_to_redis,
     new_event,
 )
 from bus.stream import Bus, try_dedupe
+from channel.base import wrap_user_query
 from channel.factory import build_channel
 from config import settings
-from contracts import IncomingMessage, TZ_SHANGHAI, ulid
+from contracts import IncomingMessage, TZ_SHANGHAI, now_utc_iso, parse_iso, ulid
+from log_rotation import rotate_all
+from proc_utils import pid_alive
+from store.sqlite import Store
+from tools.schedule import next_run_iso
 
 REPO_ROOT = Path(__file__).resolve().parent
 logger = logging.getLogger("gateway")
@@ -42,6 +55,174 @@ logger = logging.getLogger("gateway")
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 MAX_CONSECUTIVE_FAILURES = 5
 RETRY_BACKOFF_S = (2, 5, 10, 20, 30)
+
+OUTBOX_SEND_RETRIES = 3
+
+# 同一次触发（schedule_id + 当时算出的 next_run_utc）只允许被一个 gateway 实例投递。
+SCHEDULE_FIRE_PREFIX = "asst:schedule:fire:"
+
+# ReplyUser 的 products 里，这些后缀走飞书图片消息，其余走文件消息。
+FEISHU_IMAGE_SUFFIXES = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff"}
+)
+
+
+class OutboxSender(threading.Thread):
+    """消费 router 写入的 outbox，真正调用渠道发送（契约 §9.1）。
+
+    router 进程因此不再需要 `build_channel()`，冷启动不必 `import lark_oapi`。
+    发送失败重试 `OUTBOX_SEND_RETRIES` 次；仍失败则删除幂等键，并向 router
+    stream 写一条 `system` 事件（`kind=send_failed`）唤醒 router 告知用户。
+    """
+
+    def __init__(self, *, channel: Any, command_client: redis.Redis, read_client: redis.Redis) -> None:
+        super().__init__(name="outbox-sender", daemon=True)
+        self._channel = channel
+        self._redis = command_client
+        self._reader = read_client
+        self._stop_event = threading.Event()
+        self._group_ready = False
+
+    def _ensure_group(self) -> None:
+        try:
+            self._reader.xgroup_create(OUTBOX_STREAM, OUTBOX_GROUP, id="0", mkstream=True)
+        except redis.ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+
+    def _handle(self, entry_id: str, fields: dict[str, Any]) -> None:
+        raw = fields.get("data")
+        event = event_from_redis({"data": raw.decode() if isinstance(raw, bytes) else str(raw)})
+        payload = event.payload
+        chat_id = str(payload.get("chat_id") or "")
+        text = str(payload.get("text") or "")
+        reply_to = str(payload.get("reply_to") or "") or None
+        slot = str(payload.get("idem_slot") or "")
+        products = [str(item) for item in (payload.get("products") or []) if str(item).strip()]
+        key = f"{REPLY_IDEM_PREFIX}{slot}" if slot else ""
+
+        # gateway 重启后可能重放旧 outbox：幂等键已是真实 message_id 就跳过。
+        if key:
+            current = self._redis.get(key)
+            if current and current != "pending":
+                self._reader.xack(OUTBOX_STREAM, OUTBOX_GROUP, entry_id)
+                logger.info("outbox 跳过（已发送） slot=%s message_id=%s", slot, current)
+                return
+
+        failures: list[dict[str, Any]] = []
+
+        # 1) 正文（只有文件时允许 text 为空）
+        text_ok = True
+        if text.strip():
+            result = None
+            for attempt in range(1, OUTBOX_SEND_RETRIES + 1):
+                result = self._channel.send_text(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_to_message_id=reply_to,
+                )
+                if result.ok:
+                    break
+                if attempt < OUTBOX_SEND_RETRIES:
+                    self._stop_event.wait(0.3 * attempt)
+
+            text_ok = bool(result is not None and result.ok)
+            if text_ok:
+                if key:
+                    self._redis.set(key, result.message_id, xx=True, ex=86400)
+            else:
+                error = (result.error if result else "no_result") or "send_failed"
+                code = result.code if result else None
+                failures.append({"item": "text", "error": error, "code": code})
+                logger.error("outbox 正文发送失败 chat_id=%s code=%s error=%s", chat_id, code, error)
+
+        # 2) 附件按顺序发送：单个失败只影响它自己，并降级为"把路径当文本发出去"
+        for item in products:
+            ok, error, code = self._send_product(chat_id=chat_id, item=item)
+            if ok:
+                logger.info("outbox 已发送附件 chat_id=%s item=%s", chat_id, item)
+                continue
+            logger.warning("outbox 附件发送失败 chat_id=%s item=%s error=%s", chat_id, item, error)
+            failures.append({"item": item, "error": error, "code": code})
+            try:
+                self._channel.send_text(
+                    chat_id=chat_id,
+                    text=f"{item}（未能作为文件发送：{error}）",
+                )
+            except Exception:  # noqa: BLE001 - 降级提示失败也不能中断后续附件
+                logger.warning("附件降级提示发送失败 item=%s", item, exc_info=True)
+
+        # 3) 把失败回传 router，让模型决定怎么向用户解释
+        if failures:
+            if key:
+                self._redis.delete(key)   # 允许重试，不留死键
+            feedback = new_event(
+                "system",
+                "system",
+                {
+                    "kind": "send_failed" if not text_ok else "send_partial_failure",
+                    "chat_id": chat_id,
+                    "error": failures[0].get("error") or "send_failed",
+                    "code": failures[0].get("code"),
+                    "text_preview": text[:200],
+                    "failures": failures,
+                },
+            )
+            self._redis.xadd(
+                ROUTER_STREAM,
+                event_to_redis(feedback),
+                maxlen=ROUTER_STREAM_MAXLEN,
+                approximate=True,
+            )
+        self._reader.xack(OUTBOX_STREAM, OUTBOX_GROUP, entry_id)
+
+    def _send_product(self, *, chat_id: str, item: str) -> tuple[bool, str, Optional[int]]:
+        """发一个附件：URL → 文本链接；图片 → 图片消息；其它 → 文件消息。"""
+        if item.lower().startswith(("http://", "https://")):
+            result = self._channel.send_text(chat_id=chat_id, text=item)
+            return result.ok, result.error, result.code
+        path = Path(item)
+        if not path.is_absolute():
+            return False, "path_not_absolute", None
+        if not chat_id:
+            return False, "missing_chat_id", None
+        try:
+            if path.suffix.lower() in FEISHU_IMAGE_SUFFIXES:
+                result = self._channel.send_image(chat_id=chat_id, path=str(path))
+            else:
+                result = self._channel.send_file(chat_id=chat_id, path=str(path))
+        except Exception as exc:  # noqa: BLE001 - 单个附件异常不能中断整批
+            return False, f"{type(exc).__name__}: {exc}", None
+        return result.ok, result.error, result.code
+
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                if not self._group_ready:
+                    self._ensure_group()
+                    self._group_ready = True
+                result = self._reader.xreadgroup(
+                    OUTBOX_GROUP,
+                    OUTBOX_CONSUMER,
+                    {OUTBOX_STREAM: ">"},
+                    count=10,
+                    block=500,
+                )
+            except Exception:
+                logger.warning("outbox 读取失败", exc_info=True)
+                self._stop_event.wait(1.0)
+                continue
+            if not result:
+                continue
+            for entry_id, fields in result[0][1]:
+                normalized = {
+                    (k.decode() if isinstance(k, bytes) else str(k)): v for k, v in fields.items()
+                }
+                self._handle(entry_id, normalized)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.join(timeout=2)
 
 
 class RouterSupervisor(threading.Thread):
@@ -163,6 +344,33 @@ class RouterSupervisor(threading.Thread):
         self._redis.delete(ROUTER_SPAWNING_KEY)
 
 
+class LogRotator(threading.Thread):
+    """常驻线程：定期给 assistant 自己的日志做大小轮转（策略见 `log_rotation.py`）。
+
+    gateway 是唯一常驻进程，所以由它兜住 gateway/router/worker 三类日志；
+    被 cmd `>>` 或子进程持有的文件走 copytruncate，不需要重启任何进程。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(name="log-rotator", daemon=True)
+        # 不能叫 `_stop`：`threading.Thread` 内部有同名方法。
+        self._stop_event = threading.Event()
+
+    def run(self) -> None:
+        interval = max(int(settings.log_rotate_check_s), 5)
+        while not self._stop_event.is_set():
+            try:
+                for path, action, before in rotate_all(in_process=True):
+                    logger.warning("日志轮转 %s（%d 字节）-> %s", path, before, action)
+            except Exception:
+                logger.warning("日志轮转失败", exc_info=True)
+            self._stop_event.wait(interval)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.join(timeout=2)
+
+
 def _setup_logging() -> None:
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -182,11 +390,26 @@ class Gateway:
         self._bus = Bus(self._redis)
         self._bus.ensure_router_group()
         self._channel = build_channel(settings)
+        self._outbox_reader = redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_timeout=None,   # 阻塞读不能用 socket 超时
+        )
+        self._sender = OutboxSender(
+            channel=self._channel,
+            command_client=self._redis,
+            read_client=self._outbox_reader,
+        )
         self._supervisor = RouterSupervisor(
             bus=self._bus,
             command_client=self._redis,
             console=console,
         )
+        self._store = Store(settings.db_path)
+        self._store.init_schema()
+        self._watchdog = TaskWatchdog(command_client=self._redis, store=self._store)
+        self._scanner = ScheduleScanner(command_client=self._redis, store=self._store)
+        self._log_rotator = LogRotator()
 
     # ------------------------------------------------------------------ 入队
     def enqueue(self, message: IncomingMessage) -> bool:
@@ -206,7 +429,13 @@ class Gateway:
                 "event_id": message.event_id,
                 "sender_id": message.sender_id,
                 "thread_id": message.thread_id,
-                "text": message.text,
+                # 用户输入固定包装（原话 + UTC+8 时间 + 附件路径）；在进入 router 之前完成，
+                # 因此 JSONL 落盘的也是这份文本。
+                "text": wrap_user_query(
+                    message.text,
+                    create_time_ms=message.create_time,
+                    attachments=message.attachments,
+                ),
                 "create_time": message.create_time,
             },
         )
@@ -235,13 +464,23 @@ class Gateway:
 
     # ------------------------------------------------------------------ 运行
     def run_forever(self) -> None:
+        self._sender.start()
         self._supervisor.start()
+        self._watchdog.start()
+        self._scanner.start()
+        if settings.log_rotate_enabled:
+            self._log_rotator.start()
         try:
             self._channel.run_forever(self.on_message)
         except KeyboardInterrupt:
             logger.info("收到中断，准备退出")
         finally:
+            if settings.log_rotate_enabled:
+                self._log_rotator.stop()
+            self._scanner.stop()
+            self._watchdog.stop()
             self._supervisor.stop()
+            self._sender.stop()
 
     def send_once(self, text: str, *, wait_s: float = 60.0) -> int:
         """脚本化联调：入队一条控制台消息，等 router 消费完再退出。"""
@@ -258,7 +497,9 @@ class Gateway:
         if not self.enqueue(message):
             return 1
 
+        self._sender.start()
         self._supervisor.start()
+        self._watchdog.start()
         deadline = time.monotonic() + wait_s
         saw_router = False
         try:
@@ -270,6 +511,7 @@ class Gateway:
                     and self._supervisor._proc is None
                     and not self._supervisor.router_alive()
                     and not self._supervisor.has_work()
+                    and self._outbox_pending() == 0
                 ):
                     logger.info("本轮已处理完毕")
                     return 0
@@ -277,7 +519,180 @@ class Gateway:
             logger.error("等待 router 完成超时（%.0fs）", wait_s)
             return 5
         finally:
+            self._watchdog.stop()
             self._supervisor.stop()
+            self._sender.stop()
+
+    def _outbox_pending(self) -> int:
+        """outbox 里尚未发送的事件数（lag + 未 ACK）。"""
+        try:
+            for group in self._outbox_reader.xinfo_groups(OUTBOX_STREAM) or []:
+                info = {
+                    (k.decode() if isinstance(k, bytes) else str(k)): v for k, v in group.items()
+                }
+                if info.get("name") == OUTBOX_GROUP:
+                    return int(info.get("lag") or 0) + int(info.get("pending") or 0)
+        except redis.ResponseError:
+            return 0
+        return 0
+
+
+class ScheduleScanner(threading.Thread):
+    """定时任务扫描（契约 §9.3：每 `schedule_scan_interval_s` 扫一次）。
+
+    只做三件事：把到期行变成 `timer` 事件投进 router stream、推进 `next_run_utc`、
+    写日志。不 import LLM、不执行任务——触发后仍是"唤醒 router，让它自己决定做什么"。
+
+    多 gateway 实例靠 `SET NX` 抢同一次触发（键含 `schedule_id + next_run_utc`）；
+    投递失败会删键并保留 `next_run_utc`，下一轮重试。
+    """
+
+    def __init__(self, *, command_client: redis.Redis, store: Store) -> None:
+        super().__init__(name="schedule-scanner", daemon=True)
+        self._redis = command_client
+        self._store = store
+        self._stop_event = threading.Event()
+
+    def _tick(self) -> None:
+        now = now_utc_iso()
+        now_dt = parse_iso(now)
+        for record in self._store.list_due_schedules(now, limit=20):
+            key = f"{SCHEDULE_FIRE_PREFIX}{record.id}:{record.next_run_utc}"
+            if not self._redis.set(key, "1", nx=True, ex=86400):
+                continue   # 另一个 gateway 已经抢到这次触发
+            late_s = (now_dt - parse_iso(record.next_run_utc or now)).total_seconds()
+            next_iso = next_run_iso(record, after=now_dt)
+            if late_s > record.misfire_grace_s and record.catch_up != "once":
+                logger.warning(
+                    "调度 %s 迟到 %.0fs 超过宽限 %ss，跳过本次触发（下一次 %s）",
+                    record.id, late_s, record.misfire_grace_s, next_iso or "无",
+                )
+                self._store.update_schedule_after_run(record.id, next_run_utc=next_iso, ran_at_utc=now)
+                continue
+            event = new_event(
+                "timer",
+                "scheduler",
+                {
+                    "schedule_id": record.id,
+                    "scheduled_at": record.next_run_utc or "",
+                    "prompt": record.prompt,
+                },
+            )
+            try:
+                self._redis.xadd(
+                    ROUTER_STREAM,
+                    event_to_redis(event),
+                    maxlen=ROUTER_STREAM_MAXLEN,
+                    approximate=True,
+                )
+            except Exception:
+                self._redis.delete(key)
+                logger.error("调度 %s 投递失败，保留到期时间等下一轮重试", record.id, exc_info=True)
+                continue
+            self._store.update_schedule_after_run(record.id, next_run_utc=next_iso, ran_at_utc=now)
+            logger.info(
+                "调度触发 %s（迟到 %.0fs）→ timer 事件；下一次：%s",
+                record.id, late_s, next_iso or "无（一次性任务完成）",
+            )
+
+    def run(self) -> None:
+        interval = max(1, int(settings.schedule_scan_interval_s))
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception:
+                logger.warning("调度扫描失败", exc_info=True)
+            self._stop_event.wait(interval)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.join(timeout=2)
+
+
+class TaskWatchdog(threading.Thread):
+    """worker 巡检（设计文档 §5.7.3）。
+
+    每 `watch_scan_interval_s` 扫一次 `status='running'` 的会话：
+
+    - 进程不在 → `process_gone`；
+    - 进程在但 `last_seen` 超过 `stall_minutes` → `stalled`。
+
+    命中后写 `task_watch`（主键去重，只有 `first` 才提醒），再往 router stream
+    写一条 `system/kind=task_watch` 事件，让 router 去问用户"重试还是放弃"。
+    **绝不自动重派**，也不直接给用户发消息（用户出口仍是 ReplyUser）。
+    """
+
+    def __init__(self, *, command_client: redis.Redis, store: Store) -> None:
+        super().__init__(name="task-watchdog", daemon=True)
+        self._redis = command_client
+        self._store = store
+        self._stop_event = threading.Event()
+
+    def _task_chat_id(self, task_id: str) -> str:
+        path = settings.workers_dir / task_id / "task.json"
+        try:
+            return str(json.loads(path.read_text(encoding="utf-8")).get("chat_id") or "")
+        except Exception:  # noqa: BLE001 - 任务目录可能还没落盘
+            return ""
+
+    def _detect(self, session: Any) -> str:
+        if not pid_alive(session.pid):
+            return "process_gone"
+        beat = session.last_seen or session.updated_at
+        try:
+            beat_dt = datetime.fromisoformat(str(beat))
+        except (TypeError, ValueError):
+            return ""
+        if beat_dt.tzinfo is None:
+            beat_dt = beat_dt.replace(tzinfo=TZ_SHANGHAI)
+        stalled_s = (datetime.now(timezone.utc) - beat_dt.astimezone(timezone.utc)).total_seconds()
+        return "stalled" if stalled_s > settings.stall_minutes * 60 else ""
+
+    def _tick(self) -> None:
+        for session in self._store.list_sessions(status="running", limit=200):
+            reason = self._detect(session)
+            if not reason:
+                continue
+            if self._store.mark_watch(session.id, reason) != "first":
+                continue
+            task_id = session.id.split(":", 1)[1] if ":" in session.id else session.id
+            chat_id = self._task_chat_id(task_id)
+            text = (
+                f"任务 {task_id} 疑似卡住（原因：{reason}）。"
+                "请询问用户：要重试还是放弃？不要自动重派。"
+            )
+            event = new_event(
+                "system",
+                "system",
+                {
+                    "kind": "task_watch",
+                    "task_id": task_id,
+                    "reason": reason,
+                    "chat_id": chat_id,
+                    "text": text,
+                },
+                trace_id=session.id,
+            )
+            self._redis.xadd(
+                ROUTER_STREAM,
+                event_to_redis(event),
+                maxlen=ROUTER_STREAM_MAXLEN,
+                approximate=True,
+            )
+            logger.warning("巡检提醒 task=%s reason=%s chat=%s", task_id, reason, chat_id)
+
+    def run(self) -> None:
+        interval = max(5, int(settings.watch_scan_interval_s))
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception:
+                logger.warning("巡检失败", exc_info=True)
+            self._stop_event.wait(interval)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.join(timeout=2)
 
 
 def main() -> int:

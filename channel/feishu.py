@@ -23,10 +23,16 @@ import json
 import logging
 import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Any, Optional
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
+    CreateFileRequest,
+    CreateFileRequestBody,
+    CreateImageRequest,
+    CreateImageRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
     P2ImMessageReceiveV1,
@@ -48,6 +54,14 @@ DEFAULT_DEDUPE_TTL_S = 60.0
 
 # 切分优先级：段落 > 换行 > 句末标点 > 逗号/顿号 > 空白 > 硬切
 _BREAK_SEPARATORS = ("\n\n", "\n", "。", "；", "！", "？", "，", "、", " ", "\t")
+
+# 发文件上限（2026-11 真实上传实测）：
+# images 10 MiB 通过、10 MiB+1 报 234006；files 27,000,000 字节通过、27.5MB 起失败，取 25 MiB。
+DEFAULT_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_FILE_MAX_BYTES = 25 * 1024 * 1024
+IMAGE_SUFFIXES: frozenset[str] = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff"}
+)
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -137,13 +151,19 @@ class MessageDeduper:
             del self._seen[key]
 
 
-def parse_p2_message(data: Optional[P2ImMessageReceiveV1]) -> Optional[IncomingMessage]:
+def parse_p2_message(
+    data: Optional[P2ImMessageReceiveV1],
+    *,
+    download: Any = None,
+) -> Optional[IncomingMessage]:
     """把飞书 `im.message.receive_v1` 事件转成平台无关的 `IncomingMessage`（契约 §6.2）。
 
     过滤规则：
     - 只收 `sender_type in (None, "user")`（过滤机器人/应用自身消息，避免自问自答）；
-    - 只收 `message_type == "text"`；其他类型记日志后跳过（图片/文件留 v1.1）；
-    - `content` 是 JSON 字符串 `{"text": ...}`，解析失败按空文本处理；
+    - `text` 直接取正文；`image` / `file` / `audio` / `media` 通过 `download` 回调落盘，
+      文本里写本地路径（`Read` 能读图，VisionAdapter 负责多模态）；
+    - `download=None` 或下载失败 → 记日志后跳过（不影响纯文本链路）；
+    - `content` 解析失败按空文本/无附件处理；
     - 群聊文本里的 `@_user_1` 占位符按 `mentions[].key` 删除；
     - 清洗后为空 → 返回 None（例如只在群里 @ 了机器人、没说话）。
     """
@@ -160,31 +180,51 @@ def parse_p2_message(data: Optional[P2ImMessageReceiveV1]) -> Optional[IncomingM
         logger.debug("跳过非用户消息 sender_type=%s", sender_type)
         return None
 
+    message_id = getattr(message, "message_id", "") or ""
     message_type = getattr(message, "message_type", None)
-    if message_type != "text":
-        logger.info(
-            "暂不支持的消息类型 message_type=%s message_id=%s（v1 只处理 text）",
-            message_type,
-            getattr(message, "message_id", ""),
-        )
+    if message_type not in ("text", "image", "file", "audio", "media"):
+        logger.info("暂不支持的消息类型 message_type=%s message_id=%s", message_type, message_id)
         return None
 
     content = getattr(message, "content", "") or ""
     try:
-        text = json.loads(content).get("text", "")
+        body = json.loads(content) if content else {}
     except (json.JSONDecodeError, AttributeError, TypeError):
-        logger.warning("消息 content 不是合法 JSON，按空文本处理 message_id=%s",
-                       getattr(message, "message_id", ""))
-        text = ""
+        logger.warning("消息 content 不是合法 JSON，按空文本处理 message_id=%s", message_id)
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
 
-    mentions = getattr(message, "mentions", None) or []
-    for mention in mentions:
-        key = getattr(mention, "key", None)
-        if key:
-            text = text.replace(key, "")
-    text = text.strip()
-    if not text:
-        return None
+    attachment = ""
+    if message_type == "text":
+        text = str(body.get("text") or "")
+        mentions = getattr(message, "mentions", None) or []
+        for mention in mentions:
+            key = getattr(mention, "key", None)
+            if key:
+                text = text.replace(key, "")
+        text = text.strip()
+        if not text:
+            return None
+    else:
+        resource_key = str(body.get("image_key") or body.get("file_key") or "")
+        file_name = str(body.get("file_name") or "")
+        if not resource_key or download is None:
+            logger.info(
+                "附件消息无法落盘 message_type=%s message_id=%s（无 key 或无下载器）",
+                message_type, message_id,
+            )
+            return None
+        attachment = str(download(message_id, resource_key, message_type, file_name) or "")
+        if not attachment:
+            logger.warning("附件下载失败 message_type=%s message_id=%s", message_type, message_id)
+            return None
+        if message_type == "image":
+            text = f"[图片] {attachment}（本地路径，可用 Read 查看）"
+        elif message_type == "file":
+            text = f"[文件] {file_name or '未命名'} -> {attachment}"
+        else:
+            text = f"[{message_type}] -> {attachment}"
 
     sender_id_obj = getattr(sender, "sender_id", None)
     sender_id = getattr(sender_id_obj, "open_id", "") or ""
@@ -199,13 +239,14 @@ def parse_p2_message(data: Optional[P2ImMessageReceiveV1]) -> Optional[IncomingM
         channel="feishu",
         chat_id=getattr(message, "chat_id", "") or "",
         chat_type=getattr(message, "chat_type", "") or "p2p",
-        message_id=getattr(message, "message_id", "") or "",
+        message_id=message_id,
         event_id=getattr(header, "event_id", "") or "",
         sender_id=sender_id,
         text=text,
         create_time=create_time,
         thread_id=getattr(message, "thread_id", None) or None,
-        raw={"message_type": message_type, "content": content},
+        attachments=[attachment] if attachment else [],
+        raw={"message_type": message_type, "content": content, "attachment": attachment},
     )
 
 
@@ -223,6 +264,9 @@ class FeishuChannel(Channel):
         log_level: int = lark.LogLevel.INFO,
         max_text_chars: int = DEFAULT_MAX_TEXT_CHARS,
         dedupe_ttl_s: float = DEFAULT_DEDUPE_TTL_S,
+        inbox_dir: Optional[str] = None,
+        image_max_bytes: int = DEFAULT_IMAGE_MAX_BYTES,
+        file_max_bytes: int = DEFAULT_FILE_MAX_BYTES,
     ) -> None:
         self._app_id = app_id
         self._app_secret = app_secret
@@ -230,6 +274,9 @@ class FeishuChannel(Channel):
         self._log_level = log_level
         self.max_text_chars = int(max_text_chars)
         self._dedupe_ttl_s = float(dedupe_ttl_s)
+        self._image_max_bytes = int(image_max_bytes)
+        self._file_max_bytes = int(file_max_bytes)
+        self._inbox_dir = Path(inbox_dir) if inbox_dir else Path.home() / ".assistant" / "state" / "inbox"
         # OpenAPI 客户端（发消息用）；长连接客户端是另一个对象，在 run_forever 里创建。
         self._api = (
             lark.Client.builder()
@@ -239,6 +286,42 @@ class FeishuChannel(Channel):
             .log_level(log_level)
             .build()
         )
+
+    # ------------------------------------------------------------------ 收附件
+    def _fetch_attachment(self, message_id: str, resource_key: str, kind: str, file_name: str = "") -> str:
+        """下载图片/文件到 `inbox_dir`，返回本地绝对路径；失败返回空串（不抛）。"""
+        try:
+            from lark_oapi.api.im.v1 import GetMessageResourceRequest
+
+            request = (
+                GetMessageResourceRequest.builder()
+                .message_id(message_id)
+                .file_key(resource_key)
+                .type(kind)
+                .build()
+            )
+            response = self._api.im.v1.message_resource.get(request)
+            if not response.success() or response.file is None:
+                logger.warning(
+                    "附件下载失败 message_id=%s kind=%s code=%s msg=%s",
+                    message_id, kind, getattr(response, "code", ""), getattr(response, "msg", ""),
+                )
+                return ""
+            payload = response.file.read()
+            if isinstance(payload, str):
+                payload = payload.encode()
+            if not payload:
+                return ""
+            suffix = Path(file_name).suffix if file_name else ""
+            if not suffix:
+                suffix = ".png" if kind == "image" else ".bin"
+            self._inbox_dir.mkdir(parents=True, exist_ok=True)
+            target = self._inbox_dir / f"{uuid.uuid4().hex}{suffix}"
+            target.write_bytes(payload)
+            return str(target)
+        except Exception:  # noqa: BLE001 - 下载失败不能影响长连接 ACK
+            logger.warning("附件下载异常 message_id=%s kind=%s", message_id, kind, exc_info=True)
+            return ""
 
     # ------------------------------------------------------------------ 发送
     def send_text(
@@ -355,6 +438,176 @@ class FeishuChannel(Channel):
         )
         return SendResult(ok=True, message_id=message_id)
 
+    # ------------------------------------------------------------------ 发送文件
+    def _send_resource_message(
+        self,
+        *,
+        chat_id: str,
+        msg_type: str,
+        content: str,
+        reply_to_message_id: Optional[str],
+    ) -> SendResult:
+        """用已上传的 `image_key` / `file_key` 发一条消息（图片或文件）。"""
+        started = time.monotonic()
+        try:
+            if reply_to_message_id:
+                body = (
+                    ReplyMessageRequestBody.builder()
+                    .content(content)
+                    .msg_type(msg_type)
+                    .build()
+                )
+                request = (
+                    ReplyMessageRequest.builder()
+                    .message_id(reply_to_message_id)
+                    .request_body(body)
+                    .build()
+                )
+                response = self._api.im.v1.message.reply(request)
+            else:
+                body = (
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type(msg_type)
+                    .content(content)
+                    .build()
+                )
+                request = (
+                    CreateMessageRequest.builder()
+                    .receive_id_type("chat_id")
+                    .request_body(body)
+                    .build()
+                )
+                response = self._api.im.v1.message.create(request)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("发送 %s 消息异常 chat_id=%s", msg_type, chat_id)
+            return SendResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+        if not response.success():
+            raw_code = getattr(response, "code", None)
+            code = _to_int(raw_code, default=0) if raw_code is not None else None
+            msg = getattr(response, "msg", "") or ""
+            logger.warning(
+                "发送 %s 消息失败 chat_id=%s code=%s msg=%s duration_ms=%s",
+                msg_type, chat_id, code, msg, duration_ms,
+            )
+            return SendResult(ok=False, error=f"code={code} msg={msg}", code=code)
+        data = getattr(response, "data", None)
+        logger.info(
+            "发送 %s 消息成功 chat_id=%s message_id=%s duration_ms=%s",
+            msg_type, chat_id, getattr(data, "message_id", ""), duration_ms,
+        )
+        return SendResult(ok=True, message_id=getattr(data, "message_id", "") or "")
+
+    def _precheck(self, path: str, *, max_bytes: int, kind: str) -> tuple[Path | None, str]:
+        """本地预检：绝对路径 + 存在 + 大小 + 图片后缀。返回 `(path, 错误码)`。"""
+        target = Path(path)
+        if not target.is_absolute():
+            return None, "path_not_absolute"
+        try:
+            size = target.stat().st_size
+        except OSError:
+            return None, "not_found"
+        if not target.is_file():
+            return None, "not_a_file"
+        if size > max_bytes:
+            return None, f"oversized_{kind}"
+        if kind == "image" and target.suffix.lower() not in IMAGE_SUFFIXES:
+            return None, "unsupported_image_type"
+        return target, ""
+
+    def send_image(
+        self,
+        *,
+        chat_id: str,
+        path: str,
+        reply_to_message_id: Optional[str] = None,
+    ) -> SendResult:
+        """上传本地图片（`im/v1/images`）→ 发 `image` 消息；失败不抛异常。"""
+        target, reason = self._precheck(path, max_bytes=self._image_max_bytes, kind="image")
+        if target is None:
+            logger.warning("图片预检失败 path=%s reason=%s", path, reason)
+            return SendResult(ok=False, error=reason)
+        try:
+            with open(target, "rb") as fh:
+                request = (
+                    CreateImageRequest.builder()
+                    .request_body(
+                        CreateImageRequestBody.builder()
+                        .image(fh)
+                        .image_type("message")
+                        .build()
+                    )
+                    .build()
+                )
+                response = self._api.im.v1.image.create(request)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("上传图片异常 path=%s", path)
+            return SendResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+        if not response.success():
+            raw_code = getattr(response, "code", None)
+            code = _to_int(raw_code, default=0) if raw_code is not None else None
+            msg = getattr(response, "msg", "") or ""
+            logger.warning("上传图片失败 path=%s code=%s msg=%s", path, code, msg)
+            return SendResult(ok=False, error=f"upload_failed code={code} msg={msg}", code=code)
+        image_key = getattr(getattr(response, "data", None), "image_key", "") or ""
+        if not image_key:
+            return SendResult(ok=False, error="empty_image_key")
+        return self._send_resource_message(
+            chat_id=chat_id,
+            msg_type="image",
+            content=json.dumps({"image_key": image_key}, ensure_ascii=False),
+            reply_to_message_id=reply_to_message_id,
+        )
+
+    def send_file(
+        self,
+        *,
+        chat_id: str,
+        path: str,
+        name: str = "",
+        reply_to_message_id: Optional[str] = None,
+    ) -> SendResult:
+        """上传本地文件（`im/v1/files`）→ 发 `file` 消息；失败不抛异常。"""
+        target, reason = self._precheck(path, max_bytes=self._file_max_bytes, kind="file")
+        if target is None:
+            logger.warning("文件预检失败 path=%s reason=%s", path, reason)
+            return SendResult(ok=False, error=reason)
+        display_name = (name or target.name).strip() or target.name
+        try:
+            with open(target, "rb") as fh:
+                request = (
+                    CreateFileRequest.builder()
+                    .request_body(
+                        CreateFileRequestBody.builder()
+                        .file(fh)
+                        .file_type("stream")
+                        .file_name(display_name)
+                        .build()
+                    )
+                    .build()
+                )
+                response = self._api.im.v1.file.create(request)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("上传文件异常 path=%s", path)
+            return SendResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+        if not response.success():
+            raw_code = getattr(response, "code", None)
+            code = _to_int(raw_code, default=0) if raw_code is not None else None
+            msg = getattr(response, "msg", "") or ""
+            logger.warning("上传文件失败 path=%s code=%s msg=%s", path, code, msg)
+            return SendResult(ok=False, error=f"upload_failed code={code} msg={msg}", code=code)
+        file_key = getattr(getattr(response, "data", None), "file_key", "") or ""
+        if not file_key:
+            return SendResult(ok=False, error="empty_file_key")
+        return self._send_resource_message(
+            chat_id=chat_id,
+            msg_type="file",
+            content=json.dumps({"file_key": file_key}, ensure_ascii=False),
+            reply_to_message_id=reply_to_message_id,
+        )
+
     # ------------------------------------------------------------------ 接收
     def build_dispatcher(self, on_message: MessageHandler) -> "lark.EventDispatcherHandler":
         """构造事件分发器；`on_message` 必须是毫秒级返回的轻函数。
@@ -382,7 +635,7 @@ class FeishuChannel(Channel):
                     getattr(message, "chat_type", None),
                 )
 
-                incoming = parse_p2_message(data)
+                incoming = parse_p2_message(data, download=self._fetch_attachment)
                 if incoming is None:
                     return
 

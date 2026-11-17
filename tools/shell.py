@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -30,6 +31,7 @@ from tools.errors import (
     normalize_command_for_fingerprint,
     summarize_error,
 )
+from tools.rules import RuleHit, check_command_rules
 from tools.shell_backend import (
     ShellInfo,
     argv_chars,
@@ -295,6 +297,54 @@ def _early_failure(
     return body
 
 
+def _policy_failure(
+    *,
+    command: str,
+    shell_name: str,
+    hit: RuleHit,
+    started: float,
+) -> dict[str, Any]:
+    """规则层命中（命令未执行）：不重试，返回 denied_by_rule + 固定 hint。"""
+    hint = hit.hint
+    if hit.action == "need_confirm":
+        hint = hint + "\n[hint] 未经用户同意不要自行带 confirmed=true 重试。"
+    body = _early_failure(
+        command=command,
+        shell_name=shell_name,
+        error_class="policy_denied" if hit.action == "deny" else "policy_need_confirm",
+        message=hit.message,
+        hint=hint,
+        hint_key=hit.rule,
+        retryable=False,
+        started=started,
+    )
+    body["denied_by_rule"] = hit.rule
+    body["audit_id"] = ulid()
+    body["need_confirm"] = hit.action == "need_confirm"
+    if hit.rule == "R7":
+        _audit_security_event(body["audit_id"], hit.rule, command)
+    return body
+
+
+def _audit_security_event(audit_id: str, rule: str, command: str) -> None:
+    """R7（凭据外泄）留痕到 logs/security.log；写失败不影响拒绝结果。"""
+    try:
+        from datetime import datetime, timezone
+
+        directory = Path(settings.logs_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "audit_id": audit_id,
+            "rule": rule,
+            "command": command[:2000],
+        }
+        with (directory / "security.log").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except (OSError, ValueError):
+        pass
+
+
 def _write_artifact(directory: Path, text: str) -> str:
     directory.mkdir(parents=True, exist_ok=True)
     path = (directory / f"sh_{ulid()}.txt").resolve()
@@ -314,6 +364,8 @@ def _execute(
     max_timeout_ms: int,
     default_timeout_ms: int,
     tool_outputs_dir: Path,
+    workspace_root: Path,
+    confirmed: bool = False,
 ) -> dict[str, Any]:
     started = time.perf_counter()
 
@@ -417,6 +469,20 @@ def _execute(
             error_class="not_found_path",
             message=f"cwd 不存在或不是目录: {run_cwd}",
             hint=HINT_NOT_FOUND_PATH,
+            started=started,
+        )
+
+    # §12.3.1 L3 规则层：确定性判断挡在执行之前（拒绝类优先于确认类）。
+    hit = check_command_rules(
+        command,
+        workspace_root=Path(workspace_root),
+        base_dir=run_cwd,
+    )
+    if hit is not None and not (confirmed and hit.action == "need_confirm"):
+        return _policy_failure(
+            command=command,
+            shell_name=info.name,
+            hit=hit,
             started=started,
         )
 
@@ -614,6 +680,7 @@ def build_shell_tools(
         cwd: str | None = None,
         timeout_ms: int | None = None,
         shell: str = "auto",
+        confirmed: bool = False,
     ) -> dict[str, Any]:
         """在 Windows 上执行一条命令（无状态：每次新进程 + 独立 Job，cwd/env 不继承）。
 
@@ -628,6 +695,10 @@ def build_shell_tools(
           也可显式传 pwsh / powershell / cmd / wsl。
         - router profile 的 timeout_ms 上限 30000；worker 上限 600000。
         - cwd 不存在直接返回 not_found_path，不执行命令。
+        - 规则层（§12.3.1）：磁盘级破坏、递归删除根/用户目录、提权、下载|执行、
+          凭据外泄 → 直接拒绝，返回 denied_by_rule（R1/R2/R5/R6/R7），不重试；
+          关机重启、注册表/服务/计划任务、工作区外写删 → 返回 need_confirm
+          （R3/R4/R8）；只有在用户明确同意后，才可带 confirmed=true 重试一次。
         - 超时用 `taskkill /F /T` + `TerminateJobObject` 双保险杀整棵进程树，不会留下后台进程。
         - 输出超过 2000 行或 64 KB（任一）时，完整内容写
           tool_outputs/sh_<ulid>.txt，stdout 只保留头 30 + 尾 60 行 +
@@ -648,6 +719,8 @@ def build_shell_tools(
             max_timeout_ms=max_timeout_ms,
             default_timeout_ms=default_timeout_ms,
             tool_outputs_dir=outputs_dir,
+            workspace_root=Path(workspace_root).expanduser(),
+            confirmed=bool(confirmed),
         )
 
     return [Shell]

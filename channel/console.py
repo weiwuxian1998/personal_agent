@@ -51,6 +51,48 @@ class ConsoleChannel(Channel):
         print()
         return SendResult(ok=True, message_id=message_id)
 
+    def send_image(
+        self,
+        *,
+        chat_id: str,
+        path: str,
+        reply_to_message_id: Optional[str] = None,
+    ) -> SendResult:
+        return self._send_path(chat_id=chat_id, path=path, kind="image", reply_to_message_id=reply_to_message_id)
+
+    def send_file(
+        self,
+        *,
+        chat_id: str,
+        path: str,
+        name: str = "",
+        reply_to_message_id: Optional[str] = None,
+    ) -> SendResult:
+        return self._send_path(chat_id=chat_id, path=path, kind="file", reply_to_message_id=reply_to_message_id)
+
+    def _send_path(
+        self,
+        *,
+        chat_id: str,
+        path: str,
+        kind: str,
+        reply_to_message_id: Optional[str],
+    ) -> SendResult:
+        """控制台没有附件通道：把路径打印出来，并记录到 `sent` 供自检断言。"""
+        message_id = ulid()
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "text": "",
+                "kind": kind,
+                "path": path,
+                "reply_to_message_id": reply_to_message_id,
+                "message_id": message_id,
+            }
+        )
+        print(f"[console-send] {kind} {path}")
+        return SendResult(ok=True, message_id=message_id)
+
     def run_forever(self, on_message: MessageHandler) -> None:
         """逐行读 stdin；空行跳过，EOF / Ctrl+C / quit 命令时返回。"""
         while True:

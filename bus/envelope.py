@@ -16,6 +16,14 @@ ROUTER_GROUP = "router"
 ROUTER_CONSUMER = "router-1"
 ROUTER_STREAM_MAXLEN = 10000
 
+# router → gateway 的发送队列（契约 §9.1）：router 只写这里，真正调用渠道 API 的
+# 是 gateway。这样 router 进程无需 `build_channel()`，也就不会在冷启动时
+# `import lark_oapi`（实测约 47–51s）。
+OUTBOX_STREAM = "asst:stream:outbox"
+OUTBOX_GROUP = "gateway-sender"
+OUTBOX_CONSUMER = "gateway-1"
+OUTBOX_STREAM_MAXLEN = 1000
+
 WORKER_STREAM_MAXLEN = 200
 
 ROUTER_HEARTBEAT_KEY = "asst:router:heartbeat"
@@ -104,6 +112,11 @@ def event_from_redis(fields: dict[str, str]) -> Event:
 
 # ----------------------------------------------------------------------------- batch 摘要
 _MAX_TEXT_IN_DIGEST = 1200
+# 用户原话与 worker 结论给更高上限：这两类文本 router 要**原样转述**（create_session 的
+# prompt、给用户的总结），截狠了 worker 拿到的 prompt 会缺尾。上下文膨胀由
+# ContextBudgetMiddleware 的 soft/hard 预算兜底，不在摘要层省。
+_MAX_USER_TEXT_IN_DIGEST = 16000
+_MAX_WORKER_TEXT_IN_DIGEST = 8000
 
 
 def _clip(text: str, limit: int = _MAX_TEXT_IN_DIGEST) -> str:
@@ -132,11 +145,16 @@ def render_digest(batch: Iterable[Event], *, now: str | None = None) -> str:
     lines = [f"[唤醒事件 {now or now_iso()}]"]
     for e in users:
         p = e.payload
-        lines.append(f"- 用户({_hhmmss(e.ts)})：{_clip(p.get('text', ''))}")
+        lines.append(f"- 用户({_hhmmss(e.ts)})：{_clip(p.get('text', ''), _MAX_USER_TEXT_IN_DIGEST)}")
     for e in workers:
         task_id = str(e.payload.get("task_id", ""))[-8:]
         if e.type == "worker_result":
-            lines.append(f"- worker({_hhmmss(e.ts)}) 任务 {task_id} 完成，结果：{_clip(e.payload.get('text', '') or '（空）')}")
+            result_path = str(e.payload.get("result_path") or "")
+            lines.append(
+                f"- worker({_hhmmss(e.ts)}) 任务 {task_id} 完成，结果："
+                f"{_clip(e.payload.get('text', '') or '（空）', _MAX_WORKER_TEXT_IN_DIGEST)}"
+                + (f"（全文落盘于 {result_path}，需要更多细节可用 Read 读取）" if result_path else "")
+            )
         elif e.type == "worker_message":
             lines.append(
                 f"- worker({_hhmmss(e.ts)}) 任务 {task_id} 提问：{_clip(e.payload.get('text', ''))}"

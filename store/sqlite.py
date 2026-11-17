@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
   cwd TEXT, pid INTEGER, pid_started_at TEXT, parent_id TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-  first_message_at TEXT
+  first_message_at TEXT, last_seen TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status, updated_at);
 
@@ -231,6 +231,10 @@ class Store:
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA_SQL)
+            # 老库补列：CREATE TABLE IF NOT EXISTS 不会加新列。
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+            if "last_seen" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN last_seen TEXT")
 
     def table_names(self) -> list[str]:
         with self._connect() as conn:
@@ -308,6 +312,15 @@ class Store:
             conn.execute(
                 "UPDATE sessions SET first_message_at=?, updated_at=? WHERE id=?",
                 (ts or now_iso(), now_iso(), session_id),
+            )
+
+    def touch_session(self, session_id: str, ts: str | None = None) -> None:
+        """worker 每轮模型调用的心跳（§5.7.3）；巡检用它判断停滞。"""
+        now = now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET last_seen=?, updated_at=? WHERE id=?",
+                (ts or now, now, session_id),
             )
 
     def get_session(self, session_id: str) -> SessionRecord | None:
@@ -478,6 +491,16 @@ class Store:
     def set_schedule_status(self, schedule_id: str, status: str) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE schedules SET status=? WHERE id=?", (status, schedule_id))
+
+    def get_schedule(self, schedule_id: str) -> ScheduleRecord | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+        return ScheduleRecord.from_row(row) if row else None
+
+    def set_schedule_next_run(self, schedule_id: str, next_run_utc: str | None) -> None:
+        """只改下一次触发时刻（恢复调度时重算 cron），不碰 `last_run_utc`。"""
+        with self._connect() as conn:
+            conn.execute("UPDATE schedules SET next_run_utc=? WHERE id=?", (next_run_utc, schedule_id))
 
     def list_schedules(self, *, status: str | None = None, limit: int = 50) -> list[ScheduleRecord]:
         sql = "SELECT * FROM schedules"

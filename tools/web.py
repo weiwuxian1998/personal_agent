@@ -318,6 +318,17 @@ def _artifact_path(outputs_dir: Path, trace_id: str, call_id: str, index: int) -
     return (Path(outputs_dir) / trace / f"{call}-{index}.md").resolve()
 
 
+def _cap_content(content: str, max_chars: int | None) -> tuple[str, bool]:
+    """按调用方预算硬截断单条正文；返回 (正文, 是否截断)。
+
+    worker 用 2048 字符：一次 search 返回多条的正文累计仍在预算内，
+    避免上下文被工具输出撑爆（实测旧行为 40 次搜索累计 652 KB）。
+    """
+    if not max_chars or max_chars <= 0 or len(content) <= max_chars:
+        return content, False
+    return content[:max_chars] + f"\n…[正文已截断：仅保留前 {max_chars} 字符]", True
+
+
 def _maybe_stub(
     content: str,
     *,
@@ -385,12 +396,23 @@ def _normalize_result(item: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------- 工厂
-def build_web_tools(*, settings: Settings, tool_outputs_dir: Path) -> list[BaseTool]:
-    """返回 [WebSearch, WebFetch]（契约 §7.7 冻结签名）。
+def build_web_tools(
+    *,
+    settings: Settings,
+    tool_outputs_dir: Path,
+    default_count: int = 5,
+    default_need_content: bool = False,
+    max_content_chars: int | None = None,
+) -> list[BaseTool]:
+    """返回 [WebSearch, WebFetch]（契约 §7.7）。
 
     参数：
     - settings: 全局配置；凭证只取 `deepseek_search_api_key`，端点取 `search_api_base_url`；
-    - tool_outputs_dir: 超长 content 的落盘根目录（实际写到 `<dir>/<trace_id>/`）。
+    - tool_outputs_dir: 超长 content 的落盘根目录（实际写到 `<dir>/<trace_id>/`）；
+    - default_count / default_need_content: 调用方省略参数时的默认值。
+      router 用 5 / false；worker 用 `settings.worker_web_default_count`(3) / false；
+    - max_content_chars: 单条 `content` 的硬截断（worker 传 2048）。
+      None 表示不截断（仍受下面的落盘阈值约束）。
 
     凭证缺失时两个工具都返回 `not_configured`，不做任何降级。
     """
@@ -423,17 +445,21 @@ def build_web_tools(*, settings: Settings, tool_outputs_dir: Path) -> list[BaseT
 
     # ------------------------------------------------------------ WebSearch
     @tool
-    def WebSearch(query: str, count: int = 5, need_content: bool = False) -> dict[str, Any]:
+    def WebSearch(
+        query: str,
+        count: int | None = None,
+        need_content: bool | None = None,
+    ) -> dict[str, Any]:
         """联网搜索（无状态：每次实时请求 /v1/tools/search，不缓存）。
 
         入参：
         - query: 搜索词，1–128 字符；支持 site: / -site: / -词 / "短语" / lang: / after: / before:；
           不做二次改写、不加隐式引号
-        - count: 返回条数 1–50（默认 5，由签名固定）；
+        - count: 返回条数 1–50；省略时用调用方默认值（router 5 / worker 3）；
           越界按边界截断，并在返回的 count_note 里注明
-        - need_content: 是否要正文（默认 false，由签名固定）。
+        - need_content: 是否要正文；省略时用调用方默认值（router false / worker false）。
           false 时单条 content 为 ""，但 summary 仍有值（实测 1988–2870 字符，波动，可当摘要）；
-          true 时单条 content 可达 1.5 万字符，多条会顶爆上下文
+          true 时单条 content 可达 1.5 万字符，多条会顶爆上下文（worker 侧已硬截断到 2 KB/条）
 
         选路（务必遵守，否则会重复付费）：
         - 已经知道要查什么 → 直接用 `need_content=true` 一次拿多条正文，
@@ -456,7 +482,7 @@ def build_web_tools(*, settings: Settings, tool_outputs_dir: Path) -> list[BaseT
             return invalid
 
         try:
-            effective_count = int(count)
+            effective_count = int(default_count if count is None else count)
         except (TypeError, ValueError):
             return _local_failure("count 必须是整数")
         count_note = ""
@@ -470,7 +496,7 @@ def build_web_tools(*, settings: Settings, tool_outputs_dir: Path) -> list[BaseT
         if not api_key:
             return _not_configured()
 
-        want_content = bool(need_content)
+        want_content = bool(default_need_content if need_content is None else need_content)
         payload = {"query": query, "count": effective_count, "need_content": want_content}
         response = _call_json(
             f"{base_url}{_SEARCH_PATH}",
@@ -489,8 +515,9 @@ def build_web_tools(*, settings: Settings, tool_outputs_dir: Path) -> list[BaseT
         results: list[dict[str, Any]] = []
         for index, item in enumerate(raw_results, start=1):
             normalized = _normalize_result(item)
+            capped, cut = _cap_content(normalized["content"], max_content_chars)
             content, artifact = _maybe_stub(
-                normalized["content"],
+                capped,
                 header=f"[web] WebSearch 正文过长已落盘：{normalized['url']}",
                 index=index,
                 outputs_dir=outputs_dir,
@@ -502,6 +529,8 @@ def build_web_tools(*, settings: Settings, tool_outputs_dir: Path) -> list[BaseT
                 tail_lines=tail_lines,
             )
             normalized["content"] = content
+            if cut:
+                normalized["content_truncated"] = True
             if artifact is not None:
                 normalized["artifact"] = artifact
             results.append(normalized)
@@ -558,8 +587,9 @@ def build_web_tools(*, settings: Settings, tool_outputs_dir: Path) -> list[BaseT
         content = _as_str(data.get("content"))
 
         trace_id, call_id = _stub_context()
+        capped, cut = _cap_content(content, max_content_chars)
         content, artifact = _maybe_stub(
-            content,
+            capped,
             header=f"[web] WebFetch 正文过长已落盘：{url}",
             index=1,
             outputs_dir=outputs_dir,
@@ -575,10 +605,12 @@ def build_web_tools(*, settings: Settings, tool_outputs_dir: Path) -> list[BaseT
             "url": url,
             "title": title,
             "content": content,
-            "truncated": artifact is not None,
+            "truncated": artifact is not None or cut,
         }
         if artifact is not None:
             out["artifact"] = artifact
+        if cut:
+            out["content_truncated"] = True
         return out
 
     return [WebSearch, WebFetch]

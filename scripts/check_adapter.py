@@ -91,8 +91,6 @@ def test_readonly_api() -> None:
         check("events_envelope",
               all("type" in e["event"] and "payload" in e["event"] for e in events.get("items", [])))
 
-        r = client.get("/api/costs?limit=5")
-        check("costs_ok", r.json().get("ok") is True)
         r = client.get("/api/watches")
         check("watches_ok", r.json().get("ok") is True)
 

@@ -135,10 +135,13 @@ def _write_result(
     status: str,
     text: str,
     error: str = "",
-) -> str:
+) -> str | None:
     """写 `workers/<task_id>/result.json`；失败时 `error` 必须是 `类名: 消息`。
 
     返回落盘的绝对路径，随 `worker_result` 事件的 `result_path` 字段带给 router。
+    **失败返回 None**，调用方必须把 `result_path` 置空——绝不能把错误文本当成路径
+    塞进事件，否则 router 会拿它去 Read，读到的是"路径不存在"而不是任务结论。
+    写盘失败本身不阻断汇报：正文已经在事件的 `text` 里，router 只是拿不到全文副本。
     """
     payload: dict[str, str] = {"status": status, "text": text}
     if error:
@@ -148,8 +151,9 @@ def _write_result(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return str(target.resolve())
-    except Exception as e:
-        return f"result.json保存失败 {str(e)}"
+    except Exception:
+        logger.error("写 result.json 失败 task_id=%s（result_path 置空）\n%s", task_id, traceback.format_exc())
+        return None
 
 
 def main() -> int:
@@ -249,7 +253,9 @@ def main() -> int:
         text = f"任务执行失败（worker 进程内异常）：\n{error}"
 
     try:
-        result_path = _write_result(settings.workers_dir, task.task_id, status=status, text=text, error=error)
+        # 落盘失败时 result_path 为空串（_write_result 返回 None），事件里退化为
+        # "没有全文副本"，而不是一个看起来像路径的错误文本（审计 P1 里那条）。
+        result_path = _write_result(settings.workers_dir, task.task_id, status=status, text=text, error=error) or ""
         _publish(redis_client, task, text=text, status=status, error=error, result_path=result_path)
         store.set_status(session_id, status)
         store.set_first_message_at(session_id)

@@ -14,16 +14,14 @@ from agents.middleware import (
     VisionAdapterMiddleware,
 )
 from agents.prompt import router_prompt
+from agents.transcript import TranscriptMiddleware
 from config import Settings
-from skills.registry import SkillRegistry
-from tools.context import new_context
 from tools.fs import build_fs_tools
 from tools.memory import build_memory_router_tools
 from tools.reply import build_reply_user_tool
 from tools.schedule import build_schedule_tools
 from tools.sessions import SessionService, build_session_tools
 from tools.shell import build_shell_tools
-from tools.skill import build_skill_tools
 
 
 def build_router(
@@ -55,23 +53,23 @@ def build_router(
             default_cwd=play_root,
         )
     )
-    tools.append(new_context)
-    # §7.5 B1：技能说明按需加载；目录每次调用重扫，加技能 = 加文件（不需重启）。
-    tools.extend(build_skill_tools(registry=SkillRegistry(settings.skills_dir), role="router"))
+    # 上下文管理全被动（压缩/折叠由中间件自动处理），不再暴露主动 new_context 工具。
     # §7.5 B1：定时任务只由 router 管理；触发由 gateway 的 ScheduleScanner 投 timer 事件。
     tools.extend(build_schedule_tools(store=store))
-    # §3.2 / §3.4：回读落盘记录 + 读记忆 + 工具化触发记忆整理（不做定时整理）。
-    tools.extend(
-        build_memory_router_tools(settings=settings, session_service=session_service)
-    )
+    # §3.2：回读落盘记录（记忆本体 router 用通用 Read 读 index.md / threads）。
+    # 派发记忆整理统一走 create_session(task_kind="memory_consolidate")，没有专属工具。
+    tools.extend(build_memory_router_tools(settings=settings))
     return build_agent(
         settings=settings,
         tools=tools,
         system_prompt=router_prompt(settings),
         checkpointer=checkpointer,
         middleware=[
-            # 替换式折叠：折叠时追加「折叠摘要 + 记忆快照」（仅 router；worker 关闭）。
-            ContextBudgetMiddleware(settings, rehydrate_memory=True),
+            # transcript 按天流水 + created_at 打标（MEMORY_DESIGN §4/§8.2）：排最前，
+            # 保证折叠/注入发生的同一轮里消息已带时间戳、已入流水。
+            TranscriptMiddleware(settings),
+            # 被动安全网：白天预算折叠；夜间刷新走 _apply_nightly_fold（§8.2）。
+            ContextBudgetMiddleware(settings),
             # 折叠/中断留下的悬空 tool_call 与孤儿 ToolMessage 在发请求前自动修复。
             DanglingToolCallMiddleware(),
             VisionAdapterMiddleware(settings),

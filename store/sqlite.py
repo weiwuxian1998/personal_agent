@@ -2,26 +2,92 @@
 
 契约 §5.2：
 - `PRAGMA journal_mode=WAL; synchronous=NORMAL; busy_timeout=5000`；
-- 只有 router 进程写整库；worker 只调用 `record_tool_event` / `record_cost`
-  （两者各自用短连接，WAL + busy_timeout 保证并发不阻塞）；
+- 只有 router 进程写整库；worker 只调用 `record_tool_event`
+  （用短连接，WAL + busy_timeout 保证并发不阻塞）；
 - DDL 字段名/类型与契约完全一致（这里只加了 `IF NOT EXISTS` 保证 `init_schema` 幂等）。
 
 线程模型：`Store` 本身无共享连接，每个方法用一条短连接，可被多线程同时调用。
+写方法带 `_retry_transient` 退避：短连接 + WAL 下，某个连接关闭时若成为"最后一个连接"，
+会 checkpoint 并删除 `-wal`/`-shm`，与另一线程/进程打开 shm 的瞬间相撞会得到
+SQLITE_READONLY（"attempt to write a readonly database"）。这不是锁竞争，busy_timeout
+无效，只能换新连接重做整条事务，故用 20/50/120 ms 三次退避（详见 `_retry_transient`）。
 时间字段统一 ISO8601 字符串：展示/会话用 `now_iso()`（+08:00），
 调度比较用 `now_utc_iso()`（UTC、Z 结尾），比较一律走 `contracts.parse_iso`。
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import logging
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator, Literal
+from typing import Any, Callable, Iterator, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
-from contracts import ScheduleRecord, SessionRecord, now_iso, now_utc_iso, parse_iso, ulid
+from contracts import ScheduleRecord, SessionRecord, now_iso, parse_iso, ulid
+
+logger = logging.getLogger(__name__)
+
+# 短连接 + WAL 的固有问题：任何连接关闭时若成为"最后一个连接"，SQLite 会 checkpoint
+# 并删除 `-wal` / `-shm`；此刻另一线程/进程正在打开（或已持有）shm，就会判定
+# "数据库被替换"，返回 SQLITE_READONLY（表现是 "attempt to write a readonly database"）。
+# 这不是锁竞争，busy_timeout 完全不生效——只能把整条事务重来一次（新连接会重建 shm）。
+#
+# 同一套退避也覆盖常规锁竞争（SQLITE_BUSY / SQLITE_LOCKED）。
+# 个人自用场景并发写概率极低，3 次退避（20 + 50 + 120 = 190 ms）足够。
+_RETRY_BASE_CODES = frozenset({5, 6, 8})          # BUSY / LOCKED / READONLY（含扩展码）
+_RETRY_MESSAGE_HINTS = ("readonly", "locked", "busy", "unable to open database")
+_RETRY_DELAYS_S = (0.02, 0.05, 0.12)
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
+    """是否能通过"换一条新连接重来"消解的错误。
+
+    `sqlite_errorcode` 在 Python 3.11+ 才有；扩展码（如 READONLY_DBMOVED=264）
+    取低 8 位还原基础码。取不到码时退回消息匹配。
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return (code & 0xFF) in _RETRY_BASE_CODES
+    message = str(exc).lower()
+    return any(hint in message for hint in _RETRY_MESSAGE_HINTS)
+
+
+def _retry_transient(fn: F) -> F:
+    """给 Store 的公开方法加"整条事务重试"。
+
+    只能加在"整段逻辑都在 `with self._connect()` 内"的方法上：每次重试都是新连接，
+    上一次尝试已 rollback，不会有半提交状态。方法体若不碰外部副作用（写文件、发消息），
+    重试是安全的——Store 目前所有方法都满足这一点。
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self: "Store", *args: Any, **kwargs: Any) -> Any:
+        attempts = len(_RETRY_DELAYS_S) + 1
+        for index in range(attempts):
+            try:
+                return fn(self, *args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if index + 1 >= attempts or not _is_transient_sqlite_error(exc):
+                    raise
+                delay = _RETRY_DELAYS_S[index]
+                # 首次退避记 WARNING（用户该知道撞上了竞争），后续降级到 DEBUG，
+                # 避免高并发时刷屏。
+                log = logger.warning if index == 0 else logger.debug
+                log(
+                    "SQLite 瞬时错误（%s: %s），%.0f ms 后重试 %d/%d",
+                    type(exc).__name__, exc, delay * 1000, index + 1, attempts - 1,
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    return wrapper  # type: ignore[return-value]
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -45,7 +111,10 @@ CREATE TABLE IF NOT EXISTS schedules (
   next_run_utc TEXT, last_run_utc TEXT,
   misfire_grace_s INTEGER NOT NULL DEFAULT 300,
   catch_up TEXT NOT NULL DEFAULT 'once',
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  dispatch TEXT NOT NULL DEFAULT 'router',
+  task_kind TEXT,
+  title TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sched_due ON schedules(status, next_run_utc);
 
@@ -57,13 +126,6 @@ CREATE TABLE IF NOT EXISTS task_watch (
   PRIMARY KEY (task_id, reason)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_dedup ON task_watch(dedupe_key);
-
-CREATE TABLE IF NOT EXISTS cost_ledger (
-  id TEXT PRIMARY KEY, ts_utc TEXT NOT NULL, trace_id TEXT,
-  scope TEXT NOT NULL, model TEXT NOT NULL,
-  input_tokens INTEGER NOT NULL, cached_tokens INTEGER NOT NULL DEFAULT 0,
-  output_tokens INTEGER NOT NULL, cost_usd REAL NOT NULL, price_version TEXT NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS pending_approvals (
   token TEXT PRIMARY KEY, trace_id TEXT, tool TEXT NOT NULL, args_json TEXT NOT NULL,
@@ -93,7 +155,6 @@ REQUIRED_TABLES = (
     "runs",
     "schedules",
     "task_watch",
-    "cost_ledger",
     "pending_approvals",
     "approval_log",
     "tool_events",
@@ -225,6 +286,7 @@ class Store:
         finally:
             conn.close()
 
+    @_retry_transient
     def init_schema(self) -> None:
         """建表（幂等）。WAL 是数据库的持久属性，在这里写一次即可。"""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -235,6 +297,14 @@ class Store:
             columns = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
             if "last_seen" not in columns:
                 conn.execute("ALTER TABLE sessions ADD COLUMN last_seen TEXT")
+            sched_cols = {r["name"] for r in conn.execute("PRAGMA table_info(schedules)").fetchall()}
+            if "dispatch" not in sched_cols:
+                # router（默认，投 timer 事件）或 worker（gateway 直接派 worker）。
+                conn.execute("ALTER TABLE schedules ADD COLUMN dispatch TEXT NOT NULL DEFAULT 'router'")
+            if "task_kind" not in sched_cols:
+                conn.execute("ALTER TABLE schedules ADD COLUMN task_kind TEXT")
+            if "title" not in sched_cols:
+                conn.execute("ALTER TABLE schedules ADD COLUMN title TEXT")
 
     def table_names(self) -> list[str]:
         with self._connect() as conn:
@@ -248,6 +318,7 @@ class Store:
             return str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
 
     # ---------------------------------------------------------------- sessions
+    @_retry_transient
     def upsert_session(
         self,
         session_id: str,
@@ -293,6 +364,7 @@ class Store:
                 ),
             )
 
+    @_retry_transient
     def set_pid(self, session_id: str, pid: int, pid_started_at: str) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -300,6 +372,7 @@ class Store:
                 (pid, pid_started_at, now_iso(), session_id),
             )
 
+    @_retry_transient
     def set_status(self, session_id: str, status: str) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -307,6 +380,7 @@ class Store:
                 (status, now_iso(), session_id),
             )
 
+    @_retry_transient
     def set_first_message_at(self, session_id: str, ts: str | None = None) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -314,6 +388,7 @@ class Store:
                 (ts or now_iso(), now_iso(), session_id),
             )
 
+    @_retry_transient
     def touch_session(self, session_id: str, ts: str | None = None) -> None:
         """worker 每轮模型调用的心跳（§5.7.3）；巡检用它判断停滞。"""
         now = now_iso()
@@ -374,6 +449,7 @@ class Store:
         return [SessionRecord.from_row(r) for r in rows]
 
     # ---------------------------------------------------------------- runs
+    @_retry_transient
     def create_run(
         self,
         run_id: str,
@@ -392,6 +468,7 @@ class Store:
                 (run_id, session_id, trigger, status, now_iso(), turn_id),
             )
 
+    @_retry_transient
     def finish_run(self, run_id: str, *, status: str, exit_code: int | None = None) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -400,6 +477,7 @@ class Store:
             )
 
     # ---------------------------------------------------------------- schedules
+    @_retry_transient
     def create_schedule(
         self,
         *,
@@ -409,14 +487,26 @@ class Store:
         prompt: str,
         misfire_grace_s: int = 300,
         catch_up: str = "once",
+        dispatch: str = "router",
+        task_kind: str | None = None,
+        title: str | None = None,
     ) -> ScheduleRecord:
         """创建调度。`at` 优先于 `cron`；两者必须给一个。
 
         `next_run_utc` 在这里统一算成 UTC（Z 结尾）；一次性任务的 `at` 原串也保存，
         便于排查"用户写的是什么时间"。
+
+        `dispatch="worker"` 表示到点由 gateway 直接派 `task_kind` 类型的 worker，
+        不经过 router；此时 `task_kind` 必填，否则按 `general` 处理。
         """
         if not cron and not at:
             raise ValueError("create_schedule 需要 cron 或 at")
+        mode = (dispatch or "router").strip().lower()
+        if mode not in ("router", "worker"):
+            raise ValueError(f"dispatch 只能是 router 或 worker，收到 {dispatch!r}")
+        kind = (task_kind or "").strip() or None
+        if mode == "worker" and kind is None:
+            raise ValueError("dispatch=worker 需要 task_kind（例如 memory_consolidate）")
         if at:
             run_at = _parse_schedule_at(at, timezone)
             next_run_utc: str | None = _to_utc_iso(run_at)
@@ -430,10 +520,14 @@ class Store:
                 """
                 INSERT INTO schedules
                     (id, cron, at, timezone, prompt, status, next_run_utc,
-                     last_run_utc, misfire_grace_s, catch_up, created_at)
-                VALUES (?, ?, ?, ?, ?, 'active', ?, NULL, ?, ?, ?)
+                     last_run_utc, misfire_grace_s, catch_up, created_at,
+                     dispatch, task_kind, title)
+                VALUES (?, ?, ?, ?, ?, 'active', ?, NULL, ?, ?, ?, ?, ?, ?)
                 """,
-                (schedule_id, cron, at, timezone, prompt, next_run_utc, misfire_grace_s, catch_up, created_at),
+                (
+                    schedule_id, cron, at, timezone, prompt, next_run_utc,
+                    misfire_grace_s, catch_up, created_at, mode, kind, title,
+                ),
             )
         return ScheduleRecord(
             id=schedule_id,
@@ -447,6 +541,9 @@ class Store:
             misfire_grace_s=misfire_grace_s,
             catch_up=catch_up,
             created_at=created_at,
+            dispatch=mode,
+            task_kind=kind,
+            title=title,
         )
 
     def list_due_schedules(self, now_utc: str, limit: int = 20) -> list[ScheduleRecord]:
@@ -473,6 +570,7 @@ class Store:
                     break
         return due
 
+    @_retry_transient
     def update_schedule_after_run(
         self,
         schedule_id: str,
@@ -488,6 +586,7 @@ class Store:
                 (next_run_utc, ran_at_utc, status, schedule_id),
             )
 
+    @_retry_transient
     def set_schedule_status(self, schedule_id: str, status: str) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE schedules SET status=? WHERE id=?", (status, schedule_id))
@@ -497,6 +596,7 @@ class Store:
             row = conn.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
         return ScheduleRecord.from_row(row) if row else None
 
+    @_retry_transient
     def set_schedule_next_run(self, schedule_id: str, next_run_utc: str | None) -> None:
         """只改下一次触发时刻（恢复调度时重算 cron），不碰 `last_run_utc`。"""
         with self._connect() as conn:
@@ -515,6 +615,7 @@ class Store:
         return [ScheduleRecord.from_row(r) for r in rows]
 
     # ---------------------------------------------------------------- task_watch
+    @_retry_transient
     def mark_watch(
         self,
         task_id: str,
@@ -563,6 +664,7 @@ class Store:
             )
             return "seen"
 
+    @_retry_transient
     def resolve_watch(self, task_id: str, reason: str | None = None) -> None:
         with self._connect() as conn:
             if reason:
@@ -574,6 +676,7 @@ class Store:
                 conn.execute("UPDATE task_watch SET status='resolved' WHERE task_id=?", (task_id,))
 
     # ---------------------------------------------------------------- 观测
+    @_retry_transient
     def record_tool_event(
         self,
         *,
@@ -615,41 +718,8 @@ class Store:
                 ),
             )
 
-    def record_cost(
-        self,
-        *,
-        trace_id: str | None,
-        scope: str,
-        model: str,
-        input_tokens: int,
-        cached_tokens: int,
-        output_tokens: int,
-        cost_usd: float,
-        price_version: str = "v1",
-    ) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO cost_ledger
-                    (id, ts_utc, trace_id, scope, model, input_tokens, cached_tokens,
-                     output_tokens, cost_usd, price_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ulid(),
-                    now_utc_iso(),
-                    trace_id,
-                    scope,
-                    model,
-                    int(input_tokens),
-                    int(cached_tokens),
-                    int(output_tokens),
-                    float(cost_usd),
-                    price_version,
-                ),
-            )
-
     # ---------------------------------------------------------------- 审批
+    @_retry_transient
     def create_pending_approval(
         self,
         *,
@@ -678,6 +748,7 @@ class Store:
                 ),
             )
 
+    @_retry_transient
     def decide_approval(self, token: str, decision: str, note: str = "") -> dict | None:
         """裁决审批：只有仍为 pending 且未过期的 token 才能生效。
 

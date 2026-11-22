@@ -205,7 +205,14 @@ class SessionRecord:
 
 @dataclass(slots=True)
 class ScheduleRecord:
-    """`schedules` 表一行。`next_run_utc` 必须是 UTC ISO8601。"""
+    """`schedules` 表一行。`next_run_utc` 必须是 UTC ISO8601。
+
+    `dispatch` 决定到点后谁干活：
+    - `router`（默认）：投一个 `timer` 事件进 router stream，唤醒 router 自己决定；
+    - `worker`：gateway 直接 `create_session` 派一个 `task_kind` 类型的 worker，
+      不经过 router（省掉一次 LLM 往返）；worker 完成后 `worker_result` 照常回到 router。
+    `prompt` 在两种模式下都是任务描述；直发时支持 `{today}` / `{yesterday}` 占位符。
+    """
 
     id: str
     cron: Optional[str]
@@ -218,9 +225,17 @@ class ScheduleRecord:
     misfire_grace_s: int
     catch_up: str
     created_at: str
+    dispatch: str = "router"
+    task_kind: Optional[str] = None
+    title: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: Any) -> "ScheduleRecord":
+        # 兼容加列前的老库：没有 dispatch 列时按 router 处理。
+        keys = row.keys() if hasattr(row, "keys") else ()
+        dispatch = str(row["dispatch"] or "router") if "dispatch" in keys else "router"
+        task_kind = row["task_kind"] if "task_kind" in keys else None
+        title = row["title"] if "title" in keys else None
         return cls(
             id=row["id"],
             cron=row["cron"],
@@ -233,6 +248,9 @@ class ScheduleRecord:
             misfire_grace_s=row["misfire_grace_s"],
             catch_up=row["catch_up"],
             created_at=row["created_at"],
+            dispatch=dispatch,
+            task_kind=task_kind,
+            title=title,
         )
 
 

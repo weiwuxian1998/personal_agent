@@ -21,7 +21,6 @@ REST（全部 /api 前缀）：
   GET  /api/inbox                  router 入站事件记账（inbox-*.jsonl）
   GET  /api/schedules              定时任务表
   GET  /api/watches                巡检告警表
-  GET  /api/costs                  token/费用账本
   GET  /api/events?stream=&count=  stream 历史尾部（XRANGE）
 
 WS /ws 协议（JSON 帧）：
@@ -71,6 +70,7 @@ from bus.envelope import (
 from config import settings
 from contracts import now_iso
 from memory.jsonl import read_records
+from memory.layout import ledger_dir
 from proc_utils import pid_alive
 from store.checkpointer import open_checkpointer
 
@@ -547,14 +547,14 @@ def create_app() -> FastAPI:
     @app.get("/api/turns")
     async def api_turns(limit: int = Query(50, le=500)) -> dict:
         def _read() -> list[dict]:
-            records = [r for r in read_records(settings.memory_dir) if "digest" in r]
+            records = [r for r in read_records(ledger_dir(settings)) if "digest" in r]
             return records[-limit:][::-1]
         return {"ok": True, "items": await asyncio.to_thread(_read)}
 
     @app.get("/api/inbox")
     async def api_inbox(limit: int = Query(100, le=1000)) -> dict:
         def _read() -> list[dict]:
-            records = [r for r in read_records(settings.memory_dir)
+            records = [r for r in read_records(ledger_dir(settings))
                        if "event_id" in r and "type" in r]
             return records[-limit:][::-1]
         return {"ok": True, "items": await asyncio.to_thread(_read)}
@@ -570,16 +570,6 @@ def create_app() -> FastAPI:
         rows = await asyncio.to_thread(
             _query, "SELECT * FROM task_watch ORDER BY last_detected_at DESC LIMIT 100")
         return {"ok": True, "items": rows}
-
-    @app.get("/api/costs")
-    async def api_costs(limit: int = Query(100, le=1000)) -> dict:
-        rows = await asyncio.to_thread(
-            _query, "SELECT * FROM cost_ledger ORDER BY ts_utc DESC LIMIT ?", (limit,))
-        totals = await asyncio.to_thread(_query,
-            "SELECT scope, model, SUM(input_tokens) AS input_tokens, "
-            "SUM(cached_tokens) AS cached_tokens, SUM(output_tokens) AS output_tokens, "
-            "SUM(cost_usd) AS cost_usd, COUNT(*) AS calls FROM cost_ledger GROUP BY scope, model")
-        return {"ok": True, "items": rows, "totals": totals}
 
     @app.get("/api/events")
     async def api_events(stream: str = "router", count: int = Query(50, le=500)) -> dict:

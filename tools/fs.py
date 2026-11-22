@@ -10,6 +10,22 @@
   Write 的 append 模式同样读原文拼接后原子写回，并保留原文件编码；
 - 不新增 ListDir / SearchFiles 等同义工具。
 
+行号注入：
+- 所有文本读取统一注入行号前缀 `<6 位右对齐序号>→原文`（如 `   123→def main():`），
+  便于模型按行引用、按 offset 续读，也便于 Edit 后核对；
+- 前缀由工具生成，**不属于文件内容**；若模型把前缀一起复制进 `Edit.old_string`，
+  Edit 会自动剥离前缀后重试一次，不会因注入行号而报 `no_match`；
+- 落盘的 artifact 保留**不带行号**的原文（Grep / 后续处理更方便），只有返回给模型的
+  正文和 stub 的头尾带前缀。
+
+大文件：
+- ≤ 8 MB 整体解码（UTF-8/GBK 兜底），一次拿到总行数；
+- > 8 MB 走**流式逐行**读取，只保留窗口内的行（不整体读入内存），
+  窗口累计超过 64 KB 即停止，转落盘 stub；此时总行数标记为"未统计"；
+- 流式编码按 `utf-8-sig` → `gb18030` 严格试，都失败才退 `utf-8(replace)`：
+  大日志常是 GBK，先按 UTF-8 强读会得到满屏替换符；
+- offset 越界仍返回 `offset_out_of_range`，不因流式而放宽。
+
 超长处理：
 - `Read` 单次返回超过 64 KB 时，把本次窗口完整写入
   `tool_outputs/read_<ulid>.txt`，正文只留头 30 + 尾 60 行与统计（同 §7.2 的 stub 规则）；
@@ -34,6 +50,7 @@ from contracts import tool_error, ulid
 from tools.paths import (
     EXCLUDED_DIR_NAMES,
     has_excluded_part,
+    is_within,
     relative_display,
     resolve_in_roots,
     resolve_in_workspace,
@@ -55,6 +72,11 @@ GREP_MAX_LINE_CHARS = 400
 # Glob / Grep 的 limit 硬上限，避免一次吐回海量结果
 MAX_LIMIT = 2000
 _BINARY_PROBE_BYTES = 4096
+# 行号前缀：6 位右对齐 + `→`。箭头不会出现在正常源码里，
+# 因此按前缀剥离时不会误伤"数字开头 + 制表符"的数据文件。
+LINENO_GUTTER_WIDTH = 6
+LINENO_ARROW = "→"
+_LINENO_PREFIX_RE = re.compile(r"^\s{0,6}\d+" + LINENO_ARROW)
 
 IMAGE_EXTS: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
 MIME_BY_EXT: dict[str, str] = {
@@ -70,7 +92,10 @@ _WRITE_HINT = "请用相对工作区根或工作区内绝对路径重试；工�
 _OUTSIDE_HINT = "路径必须位于 workspace_root 之内（不允许 ../ 或符号链接逃逸）。"
 _READ_HINT = "路径必须位于 workspace_root 或只读附件目录内（不允许 ../ 或符号链接逃逸）。"
 _READONLY_HINT = "附件目录只读；把产出写到 workspace_root 内，附件仅用于读取。"
-_FORBIDDEN_HINT = "系统目录（C:\\Windows、AppData、Program Files 等）是硬禁区，写入/删除一律拒绝。"
+_FORBIDDEN_HINT = (
+    "系统目录（C:\\Windows、AppData、Program Files 等）与助手自身的源码属于硬禁区，写入/删除一律拒绝；"
+    "仓库里的日志/临时文件/构建产物不受此限。"
+)
 
 
 # ---------------------------------------------------------------- 内部工具函数
@@ -130,17 +155,83 @@ def _write_artifact(outputs_dir: Path, prefix: str, content: str) -> Path:
     return target
 
 
-def _stub(head: list[str], tail: list[str], *, stats: list[str], artifact: Path) -> str:
-    """长输出 stub：头 30 + 尾 60 + 统计 + 绝对路径 + 后续建议。"""
+def _stub(head: str, tail: str, *, stats: list[str], artifact: Path) -> str:
+    """长输出 stub：头 30 + 尾 60 + 统计 + 绝对路径 + 后续建议（头尾均已带行号）。"""
     parts = list(stats)
     parts.append("【头 30 行】")
-    parts.append("".join(head))
+    parts.append(head)
     parts.append("【...中间已省略...】")
     parts.append("【尾 60 行】")
-    parts.append("".join(tail))
+    parts.append(tail)
     parts.append(f"【完整内容已落盘】{artifact}")
+    parts.append("【行号】每行前缀由 Read 注入，不属于文件内容；Edit 时不要复制前缀。")
     parts.append("【提示】用 Read 的 offset/limit 分页读取，或对该落盘文件用 Grep 定位关键行。")
     return "\n".join(parts)
+
+
+def _number_lines(lines: list[str], first_lineno: int) -> str:
+    """给每行加 `<6 位右对齐行号>→` 前缀；保留原有行尾（含 CRLF、末行无换行）。"""
+    if not lines:
+        return ""
+    return "".join(
+        f"{first_lineno + idx:>{LINENO_GUTTER_WIDTH}}{LINENO_ARROW}{line}"
+        for idx, line in enumerate(lines)
+    )
+
+
+def _strip_lineno_prefixes(text: str) -> str:
+    """剥离 `old_string` 里可能被一起复制进来的行号前缀（Edit 的兼容兜底）。"""
+    if not text or LINENO_ARROW not in text:
+        return text
+    lines = text.splitlines(keepends=True)
+    return "".join(_LINENO_PREFIX_RE.sub("", line, count=1) for line in lines)
+
+
+def _stream_attempt(
+    path: Path,
+    start: int,
+    count: int,
+    encoding: str,
+    errors: str = "strict",
+) -> tuple[list[str], bool, str | None]:
+    """按指定编码流式取窗口（`_read_window_stream` 的单次尝试）。"""
+    window: list[str] = []
+    used = 0
+    more_after = False
+    with open(path, "r", encoding=encoding, errors=errors, newline="") as fh:
+        skipped = 0
+        while skipped < start:
+            if not fh.readline():
+                raise IndexError(skipped)
+            skipped += 1
+        for line in fh:
+            if len(window) >= count or used > READ_MAX_BYTES:
+                more_after = True
+                break
+            window.append(line)
+            used += len(line.encode("utf-8", errors="replace"))
+        else:
+            # 迭代自然结束：文件已在窗口内读完，总行数 = 已跳过 + 已收集
+            return window, False, str(skipped + len(window))
+    return window, more_after, None
+
+
+def _read_window_stream(path: Path, start: int, count: int) -> tuple[list[str], bool, str | None]:
+    """流式读取第 `start` 行起、最多 `count` 行的窗口，用于 > 8 MB 的大文件。
+
+    - 不整体读入内存：`readline()` 逐行推进，跳过 offset 前的行后只保留窗口；
+    - 窗口累计字节超过 `READ_MAX_BYTES` 即停止（置 `more_after`），避免单行超长文件撑爆内存；
+    - 编码按 utf-8-sig → gb18030 严格试，都失败才退 utf-8(replace)：
+      大日志常是 GBK，先按 utf-8 强读会得到满屏 `\\ufffd`；
+    - 返回 `(window, more_after, total)`：`total` 为总行数，读完后仍有剩余时为 `None`
+      （大文件不做全量行数统计）；offset 越界时抛 `IndexError`（由调用方转 error_class）。
+    """
+    for enc in ("utf-8-sig", "gb18030"):
+        try:
+            return _stream_attempt(path, start, count, enc)
+        except UnicodeDecodeError:
+            continue
+    return _stream_attempt(path, start, count, "utf-8", errors="replace")
 
 
 def _clamp(value: int, low: int, high: int) -> int:
@@ -168,12 +259,50 @@ def _walk_files(root: Path):
             yield Path(dirpath) / name
 
 
-def _glob_pattern_error(pattern: str) -> dict[str, Any]:
+def _glob_pattern_error(pattern: str, reason: str = "") -> dict[str, Any]:
     return tool_error(
         "invalid_pattern",
-        f"glob 模式非法: {pattern!r}",
-        hint="pattern 必须是相对搜索根的 glob，例如 **/*.py 或 src/**/test_*.py",
+        f"glob 模式非法{('：' + reason) if reason else ''}: {pattern!r}",
+        hint="pattern 必须是相对搜索根的 glob，例如 **/*.py 或 src/**/test_*.py；不允许 .. 或盘符/绝对路径。",
     )
+
+
+def _has_absolute_anchor(pattern: str) -> bool:
+    """pattern 是否带绝对定位：posix `/x`、Windows `C:/x` / `C:x` / UNC `//host/share`。"""
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    if PurePosixPath(pattern).is_absolute():
+        return True
+    win = PureWindowsPath(pattern)
+    return bool(win.drive or win.root)
+
+
+def _sanitize_glob_pattern(pattern: str) -> str | None:
+    """把入参规范化成「相对搜索根」的 posix glob；含逃逸成分时返回 None。
+
+    **这是 P1-3 的第一道闸**：`Path.glob()` 会真的把 `..` 解析成上级目录，
+    `pattern="../*"` 就能列出工作区外的文件（实测可列到上层目录全部文件）。
+    这里拒绝任何 `..` 段，因此 glob 永远不会向上穿越。
+
+    细节：
+    - 反斜杠统一成 `/`，空段与 `.` 段丢弃（`./a/./b` → `a/b`）；
+    - 每段先去掉尾随空白：Windows 会规范化尾随空格/点，`".. "` 实际等价于 `..`；
+      任何「只由点组成」的段（`..`、`...`）都拒绝——它们要么是上级目录，
+      要么在 Windows 上会被规范成上级目录；
+    - `**` 原样保留（它是合法的递归段，不是逃逸）；
+    - 规范化后为空（例如 pattern 就是 `..` 或 `/`）视为非法。
+    """
+    parts: list[str] = []
+    for raw in pattern.replace("\\", "/").split("/"):
+        part = raw.strip()
+        if part in ("", "."):
+            continue
+        if part.strip(".") == "":  # `..` / `...` 等纯点段
+            return None
+        parts.append(part)
+    if not parts:
+        return None
+    return "/".join(parts)
 
 
 # ---------------------------------------------------------------- 工厂
@@ -223,7 +352,10 @@ def build_fs_tools(
         - as_: auto=按扩展名判断；text=强制按文本读；image=强制按图片读
 
         返回：
-        - 文本文件：字符串（原文，不含行号）；被截断时结尾附 `[已截断]` 说明；
+        - 文本文件：字符串，**每行带行号前缀** `<6 位右对齐序号>→原文`，例如
+          `     1→import os`；前缀是工具注入的、不属于文件内容，Edit 时不要复制
+          （误带前缀时 Edit 会自动剥离重试）；被截断时结尾附 `[已截断] ... offset=N` 续读提示；
+          大文件（>8MB）走流式逐行读取，不整体载入内存；
         - 图片文件（png/jpg/jpeg/gif/webp/bmp）：单个引用文本块
           `[{"type":"text","text":"[图片] <路径> | <mime> | <n> 字节"}]`——
           **不内联 base64**（避免撑大 checkpoint / 日志）；由
@@ -291,48 +423,62 @@ def build_fs_tools(
                 hint="用 Shell 处理二进制；Read 只返回文本或图片。",
             )
 
+        start = max(0, int(offset))
+        count = _clamp(limit, 1, read_cap)
+
         if size <= READ_FULL_DECODE_BYTES:
+            # 小文件：整体解码（GBK 兜底），能拿到精确总行数
             try:
                 text, _enc = _decode_bytes(target.read_bytes())
             except OSError as exc:
                 return tool_error("read_failed", f"读取失败: {exc}")
+            lines = text.splitlines(keepends=True)
+            total: str | None = str(len(lines))
+            if start >= len(lines):
+                return tool_error(
+                    "offset_out_of_range",
+                    f"offset={start} 超过文件总行数 {len(lines)}",
+                    hint="offset 从 0 起；用更小的 offset 重试。",
+                )
+            window = lines[start : start + count]
+            consumed = start + len(window)
+            more_after = consumed < len(lines)
         else:
+            # 大文件（>8MB）：流式逐行，不整体读入内存
             try:
-                with open(target, "r", encoding="utf-8", errors="replace", newline="") as fh:
-                    text = fh.read()
+                window, more_after, total = _read_window_stream(target, start, count)
+            except IndexError as exc:
+                return tool_error(
+                    "offset_out_of_range",
+                    f"offset={start} 超过文件总行数 {exc.args[0] if exc.args else '未知'}",
+                    hint="offset 从 0 起；用更小的 offset 重试。",
+                )
             except OSError as exc:
                 return tool_error("read_failed", f"读取失败: {exc}")
+            consumed = start + len(window)
 
-        lines = text.splitlines(keepends=True)
-        total = len(lines)
-        start = max(0, int(offset))
-        if start >= total:
-            return tool_error(
-                "offset_out_of_range",
-                f"offset={start} 超过文件总行数 {total}",
-                hint="offset 从 0 起；用更小的 offset 重试。",
-            )
-        count = _clamp(limit, 1, read_cap)
-        window = lines[start : start + count]
-        body = "".join(window)
-        consumed = start + len(window)
-        truncated = consumed < total
+        total_txt = f"总行数 {total}" if total else "总行数未统计（>8MB 流式读取）"
+        raw_body = "".join(window)
+        window_bytes = len(raw_body.encode("utf-8", errors="replace"))
 
-        # 单次窗口过大 → 落盘 + stub（契约 §7.2 的同一套规则）
-        if len(body.encode("utf-8", errors="replace")) > READ_MAX_BYTES:
-            artifact = _write_artifact(outputs_dir, "read", body)
-            head = window[:30]
-            tail = window[-60:] if len(window) > 90 else []
+        # 单次窗口过大 → 落盘 + stub（契约 §7.2 的同一套规则）；artifact 存不带行号的原文
+        if window_bytes > READ_MAX_BYTES:
+            artifact = _write_artifact(outputs_dir, "read", raw_body)
+            head = _number_lines(window[:30], start + 1)
+            tail_lines = window[-60:] if len(window) > 90 else []
+            tail = _number_lines(tail_lines, consumed - len(tail_lines) + 1)
             stats = [
                 f"【文件】{target}",
-                f"【统计】总行数 {total}；本次窗口 第 {start + 1}-{consumed} 行；"
-                f"窗口 {len(window)} 行 / {len(body.encode('utf-8', errors='replace'))} 字节",
+                f"【统计】{total_txt}；本次窗口 第 {start + 1}-{consumed} 行；"
+                f"窗口 {len(window)} 行 / {window_bytes} 字节",
             ]
             return _stub(head, tail, stats=stats, artifact=artifact)
 
-        if truncated:
+        body = _number_lines(window, start + 1)
+        if more_after:
             body += (
-                f"\n\n[已截断] 文件共 {total} 行；本次返回第 {start + 1}-{consumed} 行。"
+                f"\n[已截断] 文件{('共 ' + total + ' 行') if total else '较大（>8MB，总行数未统计）'}；"
+                f"本次返回第 {start + 1}-{consumed} 行。"
                 f"继续读取请用 offset={consumed}。"
             )
         return body
@@ -369,7 +515,7 @@ def build_fs_tools(
         if is_forbidden(target):
             return tool_error(
                 "path_forbidden",
-                f"目标落在禁区（系统目录），不允许写入: {target}",
+                f"目标落在禁区（系统目录或助手源码），不允许写入: {target}",
                 hint=_FORBIDDEN_HINT,
             )
         if target.exists() and target.is_dir():
@@ -417,7 +563,8 @@ def build_fs_tools(
         - new_string: 替换后的文本
         - replace_all: false（默认）时要求 old_string 在文件中唯一；true 时全部替换
 
-        返回：`{"ok": true, "replacements": n}`；
+        返回：`{"ok": true, "replacements": n}`（若 old_string 带了 Read 注入的行号前缀、
+        被自动剥离后命中，额外返回 `stripped_line_numbers: true`）；
         失败返回 `{"ok": false, "error_class": ..., ...}`：
         - not_unique：old_string 出现多次（附 occurrences 行号），需加长上下文或传 replace_all
         - no_match：old_string 不存在（附所在文件路径），先用 Read/Grep 核对原文
@@ -434,7 +581,7 @@ def build_fs_tools(
         if is_forbidden(target):
             return tool_error(
                 "path_forbidden",
-                f"目标落在禁区（系统目录），不允许编辑: {target}",
+                f"目标落在禁区（系统目录或助手源码），不允许编辑: {target}",
                 hint=_FORBIDDEN_HINT,
             )
         if not target.exists():
@@ -463,11 +610,22 @@ def build_fs_tools(
             return tool_error("encoding_error", f"无法解码文件: {exc}", hint="用 Shell 处理该编码的文件。")
 
         occurrences = text.count(old_string)
+        stripped_lineno = False
+        if occurrences == 0:
+            # 兜底：Read 会给每行加 `   123→` 前缀，模型有时连前缀一起复制进
+            # old_string。剥离前缀后能命中就继续，避免"注入了行号反而没法编辑"。
+            cleaned = _strip_lineno_prefixes(old_string)
+            if cleaned != old_string and cleaned.strip() and text.count(cleaned) > 0:
+                old_string = cleaned
+                new_string = _strip_lineno_prefixes(new_string)
+                occurrences = text.count(old_string)
+                stripped_lineno = True
         if occurrences == 0:
             return tool_error(
                 "no_match",
                 f"old_string 在 {target} 中不存在",
-                hint="先用 Read 查看原文，或用 Grep 定位；注意缩进、引号、换行必须完全一致。",
+                hint="先用 Read 查看原文，或用 Grep 定位；注意缩进、引号、换行必须完全一致"
+                "（Read 输出的行号前缀不要复制，工具会剥离，但内容必须逐字符一致）。",
             )
         if occurrences > 1 and not replace_all:
             lines = _count_occurrence_lines(text, old_string)
@@ -484,7 +642,10 @@ def build_fs_tools(
             _atomic_write(target, updated, encoding=encoding)
         except OSError as exc:
             return tool_error("write_failed", f"写回失败: {exc}", hint="检查路径是否可写。")
-        return {"ok": True, "replacements": replacements, "path": str(target)}
+        result: dict[str, Any] = {"ok": True, "replacements": replacements, "path": str(target)}
+        if stripped_lineno:
+            result["stripped_line_numbers"] = True
+        return result
 
     # ------------------------------------------------------------ DeleteFile
     @tool("DeleteFile")
@@ -554,7 +715,9 @@ def build_fs_tools(
         始终排除 `.git` / `node_modules` / `.venv` / `__pycache__` 目录。
 
         入参：
-        - pattern: 相对搜索根的 glob，支持 `**`（如 `**/*.py`、`src/**/test_*.py`）
+        - pattern: 相对搜索根的 glob，支持 `**`（如 `**/*.py`、`src/**/test_*.py`）；
+          **不允许 `..`**（`Path.glob` 会真的向上穿越目录），也不允许指向搜索根之外的
+          绝对路径——两者都返回 `error_class="invalid_pattern"`
         - path: 搜索根（workspace_root / 附件目录内的绝对路径，或相对工作区路径）；
           默认 workspace_root
         - limit: 最多返回条数（默认 200，硬上限 2000）
@@ -577,11 +740,22 @@ def build_fs_tools(
         if not isinstance(pattern, str) or not pattern.strip():
             return _glob_pattern_error(pattern)
 
-        pat = pattern.replace("\\", "/").strip()
+        raw_pat = pattern.replace("\\", "/").strip()
+        # 绝对 pattern（`D:/x`、`/x`、`//host/share`）只允许落在搜索根所属 root 内：
+        # 先解析成 root 内的相对路径，再交给下面的净化函数。docstring 要求 pattern
+        # 相对搜索根，保留绝对写法只是为了兼容既有调用，绝不放宽范围。
+        if _has_absolute_anchor(raw_pat):
+            try:
+                abs_pat = resolve_in_workspace(raw_pat, base_root)
+                raw_pat = abs_pat.relative_to(base_root).as_posix()
+            except ValueError:
+                return _glob_pattern_error(pattern, "绝对 pattern 不在搜索根内")
+
+        pat = _sanitize_glob_pattern(raw_pat)
+        if pat is None:
+            return _glob_pattern_error(pattern, "不允许 .. 或指向搜索根之外")
+
         try:
-            if Path(pat).is_absolute():
-                abs_pat = resolve_in_roots(pat, allowed_roots)
-                pat = abs_pat.relative_to(base_root).as_posix()
             matches = search_root.glob(pat)
             keep_n = _clamp(limit, 1, MAX_LIMIT) + 1
             heap: list[tuple[float, str]] = []
@@ -589,6 +763,10 @@ def build_fs_tools(
             for item in matches:
                 try:
                     if not item.is_file():
+                        continue
+                    # 第二道闸：pattern 已不许 `..`，这里再挡符号链接/junction 逃逸，
+                    # 并保证返回的绝对路径一定落在搜索根的 root 之内（P1-3）。
+                    if not is_within(item.resolve(), base_root):
                         continue
                 except OSError:
                     continue

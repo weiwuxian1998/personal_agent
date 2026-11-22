@@ -22,6 +22,7 @@ from config import settings
 from contracts import ToolProfile, ulid
 from tools import winjob
 from tools.errors import (
+    HINT_CWD_FORBIDDEN,
     HINT_NOT_FOUND_PATH,
     ErrorInfo,
     RetryTracker,
@@ -31,7 +32,7 @@ from tools.errors import (
     normalize_command_for_fingerprint,
     summarize_error,
 )
-from tools.rules import RuleHit, check_command_rules
+from tools.rules import RuleHit, check_command_rules, is_cwd_forbidden
 from tools.shell_backend import (
     ShellInfo,
     argv_chars,
@@ -471,6 +472,24 @@ def _execute(
             hint=HINT_NOT_FOUND_PATH,
             started=started,
         )
+    # P1-5：cwd 不能落在**系统目录**（Windows / Program Files / AppData / ProgramData）。
+    # 原先只校验 is_dir()，于是 `Shell(cwd="C:/Windows/System32")` 可以合法起进程——
+    # fs 工具写不进的地方，Shell 却能以它为工作目录跑命令，且 R8 的相对路径判断
+    # 也以这个 cwd 为基准。
+    # 口径（is_cwd_forbidden）刻意比 is_forbidden 窄两档：
+    #   · 盘符根放行 —— PLAY_ROOT 默认就是 `D:\`，它是合法的默认 cwd；
+    #   · 助手源码目录放行 —— 在仓库根跑 git / pytest 是正常用法，
+    #     源码的**写入**保护由 fs 工具与 R8 负责，不该在 cwd 这层顺手挡掉。
+    if is_cwd_forbidden(run_cwd):
+        return _early_failure(
+            command=command,
+            shell_name=info.name,
+            error_class="cwd_forbidden",
+            message=f"cwd 落在系统目录（不允许作为工作目录起进程）: {run_cwd}",
+            hint=HINT_CWD_FORBIDDEN,
+            hint_key="cwd_forbidden",
+            started=started,
+        )
 
     # §12.3.1 L3 规则层：确定性判断挡在执行之前（拒绝类优先于确认类）。
     hit = check_command_rules(
@@ -695,6 +714,8 @@ def build_shell_tools(
           也可显式传 pwsh / powershell / cmd / wsl。
         - router profile 的 timeout_ms 上限 30000；worker 上限 600000。
         - cwd 不存在直接返回 not_found_path，不执行命令。
+        - cwd 落在系统目录（Windows / Program Files / AppData / ProgramData）返回
+          cwd_forbidden，不执行命令；盘符根与助手仓库目录仍允许作为 cwd。
         - 规则层（§12.3.1）：磁盘级破坏、递归删除根/用户目录、提权、下载|执行、
           凭据外泄 → 直接拒绝，返回 denied_by_rule（R1/R2/R5/R6/R7），不重试；
           关机重启、注册表/服务/计划任务、工作区外写删 → 返回 need_confirm

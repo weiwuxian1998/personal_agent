@@ -47,7 +47,7 @@ from contracts import IncomingMessage, TZ_SHANGHAI, now_utc_iso, parse_iso, ulid
 from log_rotation import rotate_all
 from proc_utils import pid_alive
 from store.sqlite import Store
-from tools.schedule import next_run_iso
+from tools.schedule import next_run_iso, render_schedule_prompt
 
 REPO_ROOT = Path(__file__).resolve().parent
 logger = logging.getLogger("gateway")
@@ -540,11 +540,15 @@ class Gateway:
 class ScheduleScanner(threading.Thread):
     """定时任务扫描（契约 §9.3：每 `schedule_scan_interval_s` 扫一次）。
 
-    只做三件事：把到期行变成 `timer` 事件投进 router stream、推进 `next_run_utc`、
-    写日志。不 import LLM、不执行任务——触发后仍是"唤醒 router，让它自己决定做什么"。
+    到期行按 `dispatch` 分两条路：
 
-    多 gateway 实例靠 `SET NX` 抢同一次触发（键含 `schedule_id + next_run_utc`）；
-    投递失败会删键并保留 `next_run_utc`，下一轮重试。
+    - `router`（默认）：投一条 `timer` 事件进 router stream，唤醒 router 自己决定做什么；
+    - `worker`：gateway 直接 `create_session(task_kind=...)` 派 worker，跳过 router 的
+      LLM 往返（记忆整理这类"动作固定"的活走这条）；worker 跑完自己把 `worker_result`
+      投回 router stream，router 侧记账/汇报照旧，不需要 gateway 中转结果。
+
+    两条路都会推进 `next_run_utc`。多 gateway 实例靠 `SET NX` 抢同一次触发（键含
+    `schedule_id + next_run_utc`）；投递或派发失败会删键并保留 `next_run_utc`，下一轮重试。
     """
 
     def __init__(self, *, command_client: redis.Redis, store: Store) -> None:
@@ -552,6 +556,61 @@ class ScheduleScanner(threading.Thread):
         self._redis = command_client
         self._store = store
         self._stop_event = threading.Event()
+        # SessionService 首次直发时才构造：它会 import langchain，不该拖慢 gateway 冷启动。
+        self._sessions: Any = None
+
+    def _session_service(self) -> Any:
+        if self._sessions is None:
+            from tools.sessions import SessionService
+
+            self._sessions = SessionService(
+                store=self._store,
+                bus=Bus(self._redis),
+                redis_client=self._redis,
+                settings=settings,
+                repo_root=Path(__file__).resolve().parent,
+                checkpointer=None,   # 直发只负责创建，不读 checkpoint
+            )
+        return self._sessions
+
+    def _fire_worker(
+        self, record: Any, *, now_dt: datetime, next_iso: str | None, key: str
+    ) -> None:
+        """dispatch=worker：直接派 worker，不经过 router。失败则删锁等下一轮。"""
+        kind = (record.task_kind or "").strip()
+        if not kind:
+            logger.error("调度 %s 直发 worker 但缺少 task_kind，本轮跳过", record.id)
+            self._store.update_schedule_after_run(
+                record.id, next_run_utc=next_iso, ran_at_utc=now_utc_iso()
+            )
+            return
+        try:
+            service = self._session_service()
+        except Exception:
+            self._redis.delete(key)
+            logger.error("调度 %s 直发 worker 失败：SessionService 不可用", record.id, exc_info=True)
+            return
+        prompt = render_schedule_prompt(record.prompt, at=now_dt)
+        title = render_schedule_prompt(record.title, at=now_dt) if record.title else None
+        try:
+            result = service.create_session(prompt, title=title, task_kind=kind)
+        except Exception as exc:
+            self._redis.delete(key)
+            logger.error("调度 %s 直发 worker 异常：%s", record.id, exc, exc_info=True)
+            return
+        if not result.get("ok"):
+            self._redis.delete(key)
+            logger.error(
+                "调度 %s 直发 worker 失败：%s", record.id, result.get("message") or result
+            )
+            return
+        self._store.update_schedule_after_run(
+            record.id, next_run_utc=next_iso, ran_at_utc=now_utc_iso()
+        )
+        logger.info(
+            "调度触发 %s → 直发 worker task=%s kind=%s；下一次：%s",
+            record.id, result.get("task_id"), kind, next_iso or "无（一次性任务完成）",
+        )
 
     def _tick(self) -> None:
         now = now_utc_iso()
@@ -568,6 +627,9 @@ class ScheduleScanner(threading.Thread):
                     record.id, late_s, record.misfire_grace_s, next_iso or "无",
                 )
                 self._store.update_schedule_after_run(record.id, next_run_utc=next_iso, ran_at_utc=now)
+                continue
+            if str(record.dispatch or "router").strip().lower() == "worker":
+                self._fire_worker(record, now_dt=now_dt, next_iso=next_iso, key=key)
                 continue
             event = new_event(
                 "timer",

@@ -6,7 +6,7 @@
 ## 0. 先设两个变量（每个新窗口执行一次）
 
 ```powershell
-$P  = 'C:\Users\34897\Documents\Trae-CN\temp_20261108_06\personal-assistant'
+$P  = 'D:\personal_agent'
 $PY = 'C:\Users\34897\miniconda3\envs\feishu\python.exe'
 ```
 
@@ -95,8 +95,8 @@ Set-Location $P
 | gateway 主日志 | `$P\logs\gateway-live.log` | stdout+stderr 合并写入，UTF-8 |
 | gateway 错误日志 | `$P\logs\gateway-live.err.log` | 实际为 0 字节（`.cmd` 里已 `2>&1` 合并） |
 | 旧编码历史 | `$P\logs\gateway-live.20261109-pre-utf8.log` | 2026-11-09 21:23 之前 |
-| router | `C:\Users\34897\Documents\Trae-CN\temp_20261108_06\assistant-data\logs\router-YYYY-MM-DD.log` | **按上海时间每天一个**，追加写 |
-| worker | `C:\Users\34897\Documents\Trae-CN\temp_20261108_06\assistant-data\logs\worker-<task_id>.log` | 每任务一个 |
+| router | `$env:USERPROFILE\.assistant\logs\router-YYYY-MM-DD.log` | **按上海时间每天一个**，追加写 |
+| worker | `$env:USERPROFILE\.assistant\logs\worker-<task_id>.log` | 每任务一个 |
 | 进程信息 | `$P\logs\gateway.pid` | `start` 写入，`stop` 删除 |
 
 ```powershell
@@ -107,7 +107,7 @@ Get-Content "$P\logs\gateway-live.log" -Tail 50 -Encoding UTF8
 Get-Content "$P\logs\gateway-live.log" -Tail 20 -Wait -Encoding UTF8
 
 # router 今天的日志
-Get-Content "C:\Users\34897\Documents\Trae-CN\temp_20261108_06\assistant-data\logs\router-$(Get-Date -Format yyyy-MM-dd).log" -Tail 50
+Get-Content "$env:USERPROFILE\.assistant\logs\router-$(Get-Date -Format yyyy-MM-dd).log" -Tail 50
 
 # 按关键字抓（日志已有 170MB+，不要全量 Get-Content）
 Select-String -Path "$P\logs\gateway-live.log" -Pattern "已拉起 router|router 异常退出|router 正常退出|发送成功" |
@@ -182,8 +182,8 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
 
 ```powershell
 $task = '<task_id>'
-Get-Content "C:\Users\34897\Documents\Trae-CN\temp_20261108_06\assistant-data\workers\$task\result.json" -Raw -Encoding UTF8
-Get-Content "C:\Users\34897\Documents\Trae-CN\temp_20261108_06\assistant-data\workers\$task\task.json"   -Raw -Encoding UTF8
+Get-Content "$env:USERPROFILE\.assistant\workers\$task\result.json" -Raw -Encoding UTF8
+Get-Content "$env:USERPROFILE\.assistant\workers\$task\task.json"   -Raw -Encoding UTF8
 ```
 
 ### 5.3 DB 里 `running` 但进程已消失的僵尸行

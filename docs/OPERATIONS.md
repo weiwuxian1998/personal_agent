@@ -1,6 +1,6 @@
 # 运维手册（Gateway）
 
-适用目录：`C:\Users\34897\Documents\Trae-CN\temp_20261108_06\personal-assistant`
+适用目录：`D:\personal_agent`
 
 本手册只覆盖**手动启动**的常驻 gateway（飞书长连接 + outbox 发送）。不包含计划任务、开机自启、Windows 服务、看门狗或自动重启——gateway 只在你手动启动后运行。
 
@@ -19,7 +19,7 @@
    | 变量 | 作用 |
    |---|---|
    | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 飞书应用凭证，长连接必需 |
-   | `DATA_DIR` | 运行数据根目录，当前为 `C:\Users\34897\Documents\Trae-CN\temp_20261108_06\assistant-data` |
+   | `DATA_DIR` | 运行数据根目录，默认 `%USERPROFILE%\.assistant`（**在 play_root 之外**；2026-11-22 前是 `D:\personal_agent-data`） |
    | `REDIS_URL` | Stream 总线（事件队列 / outbox / 去重 / 心跳） |
    | `DATABASE_URL` | Postgres（thread 状态、checkpoint） |
 
@@ -35,7 +35,7 @@
 
 ## 2. 日常启动 / 停止 / 查看
 
-脚本目录：`C:\Users\34897\Documents\Trae-CN\temp_20261108_06\personal-assistant\scripts`
+脚本目录：`D:\personal_agent\scripts`
 
 | 操作 | 双击文件 | 等价命令 |
 |---|---|---|
@@ -63,10 +63,10 @@ python.exe <- cmd.exe <- WmiPrvSE.exe <- svchost.exe <- services.exe
 
 | 项 | 位置 |
 |---|---|
-| 当前日志 | `C:\Users\34897\Documents\Trae-CN\temp_20261108_06\personal-assistant\logs\gateway-live.log` |
+| 当前日志 | `D:\personal_agent\logs\gateway-live.log` |
 | 历史（2026-11-09 21:23 前的旧编码） | `logs\gateway-live.20261109-pre-utf8.log` |
-| 路由器日志 | `C:\Users\34897\Documents\Trae-CN\temp_20261108_06\assistant-data\logs\router-YYYY-MM-DD.log` |
-| worker 日志 | `...\assistant-data\logs\worker-<task_id>.log` |
+| 路由器日志 | `%USERPROFILE%\.assistant\logs\router-YYYY-MM-DD.log` |
+| worker 日志 | `%USERPROFILE%\.assistant\logs\worker-<task_id>.log` |
 | 进程信息 | `logs\gateway.pid`（start 写入，stop 删除） |
 
 日志统一 UTF-8（启动包装脚本里设置了 `PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8`）。

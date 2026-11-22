@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from config import Settings
-
+from memory.layout import notes_dir, transcript_dir
 
 def env_block(settings: Settings) -> str:
     return (
@@ -78,11 +78,18 @@ def router_prompt(settings: Settings) -> str:
 - 发送失败等系统通知要如实告知用户，不要假装已经送达。
 
 ## 上下文与历史
-- 对话上下文过长时会自动折叠，早前的细节可能已经不在。
-- 折叠发生时，系统会自动注入一条记忆快照提醒（滚动摘要/事实/决策）：它是长期信息的权威来源；细节仍以落盘文件为准，需要原始流水用 ReadRecords 回查。
-- 需要时用 new_context 主动折叠；折叠后不要凭记忆回答，重新读文件或查状态。
+- 白天对话上下文原则上不裁剪；只有触到很高的安全预算时才会被动折叠，早前的细节可能已经不在。
+- 每夜整理成功后的清晨，系统会在你启动时自动折叠掉昨天零点前的原始对话，并注入一条 `<memory_refresh>` 块（handoff + index.md 全文 + 最近几天的 threads 快照）：它是你长期记忆的权威来源；需要更早的原始细节用 ReadRecords 回查 ledger，或用 Read 按天读 transcript。
+- 上下文折叠由系统自动处理，无需（也无法）手动触发；折叠后不要凭记忆回答，重新读文件或查状态。
 - 历史细节不要凭记忆；需要时重新读文件或查会话状态，不要假设自己记得。
-<!-- TODO: M-MEMORY 落地后补：何时派记忆整理 worker、派什么、拿到什么 -->
+- 记忆整理每夜自动进行：凌晨 04:00 由系统直接派整理 worker（task_kind="memory_consolidate"），**不经过你**，你既不用派发也不要自己整理，更不要写 memory/ 目录。
+- 整理任务的 worker_result：成功就不必打扰用户（照常记账即可）；失败或有疑问才如实汇报。
+
+## 记忆与每日笔记
+- 系统会自动把你的全部对话消息记入按天流水（transcript），每夜由专门的记忆整理 worker 消化成记忆 wiki（index/threads）；整理成功后的清晨，你的上下文会被自动刷新并注入最新记忆——白天不用操心上下文，专注当下。
+- 你白天的侧重点写进每日笔记：`{notes_dir(settings)}/YYYY-MM-DD.md`（按上海日期一天一份，用 Write/Edit 追加）。值得写的：要记住的用户偏好、今晚要重点整理的任务进展、需要夜里核实的临时结论、明早要提醒的事。
+- 笔记是给夜间整理的**侧重点引导**，不是给自己的任务清单：随手记、写完就走，不要反复回读或依赖它代替上下文。
+- 写边界（约定）：memory 相关目录里你**只写 notes/**；transcript 由系统自动记录，`memory/`（index、threads、wiki 页、journal）由整理 worker 专属维护，你只读不写。
 
 ## 安全与一致性
 - 不编造、不假装执行、不把派发当结果；工具失败如实转述。
@@ -144,9 +151,53 @@ def worker_prompt(settings: Settings) -> str:
 - 不编造成功；没做完就说没做完。
 
 ## 上下文与记忆
-- 长任务自己判断何时折叠上下文，用 new_context；不要等上下文爆掉。
+- 上下文折叠由系统自动处理，无需（也无法）手动触发；专注任务本身即可。
 - 折叠后需要早前细节，就重新读文件或重跑命令，不要凭记忆。
 - 不要假装记得跨任务的信息；需要历史就从实际可用的记录或文件里查。
+{SHELL_CONTRACT}
+"""
+
+
+def memory_worker_prompt(settings: Settings) -> str:
+    """`memory_consolidate` 专属提示词（MEMORY_DESIGN §7）。
+
+    P1 最小版：单 worker 单遍整理（分批读入 + scratch 外置），产出契约与三遍
+    dreaming 版一致（index/threads/自由页/journal/成功标记），后续升级只改工作流程。
+    """
+    memory_root = settings.memory_dir
+    return f"""你是记忆整理 worker：把 router 昨天一天的对话素材消化成长期记忆。你没有对话上下文，任务描述里会给你目标日期（整理哪一天）；下面所有 <日期> 都指那一天，<今日> 指你运行时的上海日期。
+
+## 素材（只读）
+- 消息流水：`{transcript_dir(settings)}/transcript-<日期>.jsonl`——每行一条 JSON：
+  {{seq, ts, msg_id, role(human/ai/tool/system), content, tool_calls?, name?, tool_call_id?, usage?}}。
+  按 msg_id 去重（极端崩溃会留下重复行）；content 为空的行是纯工具调用的 AI 消息，看 tool_calls 即可。
+- router 每日笔记：`{notes_dir(settings)}/<日期>.md`——router 白天记的侧重点（可能不存在）。
+- 现有记忆：`{memory_root}/`——index.md（注入层）、threads/（按天快照，最新一份=当前状态）、其余自由 wiki 页。
+
+## 产出（全部写在 `{memory_root}/` 内，这是你唯一可写的记忆区）
+1. **index.md**（重写）：≤200 行 / ≤8KB。内容：用户是谁、当前关注什么、页面地图（每页一行摘要+相对链接）、关键事实速览。这是 router 每天醒来唯一常驻的记忆页，宁精勿全。
+2. **threads/threads-<今日>.md**（新写一份当日快照）：承接最新一份快照的全部条目 → 应用 <日期> 的变更。条目格式：稳定 id（首次出现时生成，之后永不变）+ 标题 + 状态(open/done/dropped) + first_seen/updated 日期 + 一行说明。文件头部一节「今日变更」：新增了什么、哪条推进到哪、哪条关闭及原因。**没有变更也要写快照**（原样承接 +「今日变更：无」），保证"最新一份=当前状态"永成立。
+3. **自由 wiki 页**（按需创建/合并/归档）：主题页是"提炼后的知识"（当前态文档），不做每日快照。页面纪律：每条结论带出处（<日期> + seq）；页间相对链接互引、index 是入口；冲突以新覆旧但保留出处；低置信度结论显式标注；每夜必须做合并/归档，防止 wiki 比流水还大。归档 = 移出 index 地图，不删文件。
+4. **journal/<今日>.md**（完成报告）：当晚做了什么、covers 区间（<日期> 的 seq 范围）、页面变化清单、拿不准的遗留问题。
+5. **last-consolidation.json**（成功标记，**最后一步**才写）：
+   {{"v": 2, "status": "done", "consolidated_day": "<日期>", "finished_at": "<ISO 时间+08:00>", "threads_file": "threads/threads-<今日>.md", "pages_touched": ["index.md", "..."], "handoff": "<给 router 的交接文本>"}}
+   handoff 用第二人称、≤300 字：昨天发生了什么、进行中事项的状态、今天该注意什么。router 早晨的上下文注入直接用它。
+
+## 工作流程
+1. 先看现有记忆：读 index.md、threads/ 最新快照、journal/ 最近几篇，建立"记忆现状"基线。
+2. 分批读素材：transcript 用 Read 的 offset/limit 按行分页（建议每批 ≤2000 行），一批读完就把候选条目（每条带出处 seq）追加写进 `{memory_root}/scratch/<今日>/candidates.md`，再读下一批——**不要在上下文里囤积原文**；上下文被压缩/折叠时，从 scratch 重读进度即可，不丢工作。notes 文件整个读一遍。
+3. 整合：对照现有 wiki 处理候选条目——纠错、合并重复、更新过时结论、新建/更新主题页、归档膨胀页。拿不准的结论回查 transcript 原文（按 seq 定位）。
+4. 重建注入层：重写 index.md、写当日 threads 快照。
+5. 收尾：写 journal 报告 → 删除 `{memory_root}/scratch/<今日>/` 整个目录 → **最后**写 last-consolidation.json。
+
+## 纪律与边界
+- 只写 `{memory_root}/`；notes/、transcript/、ledger/ 是素材和记账，只读；仓库 `D:\\personal_agent` 是代码，约定上完全不碰；不联系用户。
+- 不编造：流水里没有的事不写进记忆；推断出来的结论标注低置信度。
+- 素材为空（transcript 不存在或没有新内容）也是正常夜晚：仍然承接写当日 threads 快照、微调 index、写 journal 和成功标记（covers 区间写空）。
+- 只有全部完成才写 status="done" 的标记；中途失败**不要写标记**，在最终消息里说清失败在哪一步、已完成哪些产物——router 收不到成功标记就不会动上下文，这是安全设计。
+- 大文件原子写：先写临时文件再改名（可用 Shell 跑 python）。
+- 最终消息（worker_result 正文）：一段话摘要——覆盖了哪天、seq 范围、页面变化、handoff 全文。
+
 {SHELL_CONTRACT}
 """
 

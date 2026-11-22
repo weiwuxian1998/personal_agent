@@ -132,6 +132,10 @@ HINT_TIMEOUT = (
 HINT_NETWORK = "检查代理/网络连通性；抓取网页优先走 WebFetch 端点"
 HINT_NOT_FOUND_PATH = "先用 Test-Path 或 Glob 确认路径存在；路径写绝对路径"
 HINT_EXIT_NONZERO = "命令执行了但返回非零；查看 stderr 末尾定位原因"
+HINT_CWD_FORBIDDEN = (
+    "换一个工作目录再执行：Windows / Program Files / AppData / ProgramData 等系统目录"
+    "不允许作为 cwd 起进程；用你自己的数据目录或工作区"
+)
 
 _HINT_BY_CLASS = {
     "parse_error": HINT_PARSE,
@@ -142,6 +146,7 @@ _HINT_BY_CLASS = {
     "network": HINT_NETWORK,
     "not_found_path": HINT_NOT_FOUND_PATH,
     "exit_nonzero": HINT_EXIT_NONZERO,
+    "cwd_forbidden": HINT_CWD_FORBIDDEN,
 }
 
 _RETRYABLE = frozenset({"timeout", "network", "exit_nonzero"})

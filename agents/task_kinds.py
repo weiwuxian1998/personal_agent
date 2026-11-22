@@ -5,7 +5,8 @@
 
 当前取值：
 - `general`：默认，通用 worker（fs / shell / web）；
-- `memory_consolidate`：记忆整理 worker，只读写 `memory/` 目录；
+- `memory_consolidate`：记忆整理 worker（MEMORY_DESIGN §7）：与 general 同一套通用
+  fs + Shell，不造专属工具；"只写 memory 区、不碰 notes/素材" 是提示词约定不是沙箱；
 - `cua`：纯视觉 Computer Use worker（§8）：12 个动作原语 + `act` 批次入口，
   不复用 `general` 的 fs/shell 工具集；坐标只认截图像素，不出现 ref/DOM。`cua` 包
   依赖 Windows DLL，因此走惰性导入。
@@ -22,12 +23,8 @@ from typing import Any, Callable
 from agents.prompt import worker_prompt
 from config import Settings
 from contracts import TaskSpec
-from skills.registry import SkillRegistry
-from tools.context import new_context
 from tools.fs import build_fs_tools
-from tools.memory import build_memory_worker_tools
 from tools.shell import build_shell_tools
-from tools.skill import build_skill_tools
 from tools.web import build_web_tools
 
 ToolBuilder = Callable[..., list[Any]]
@@ -55,17 +52,27 @@ class TaskKindSpec:
     default_cwd: Callable[[Settings], Path]
     implemented: bool = True
     note: str = ""
+    # 按类型差异化的上下文窗口（MEMORY_DESIGN §7-3）：0 = 用全局默认
+    # （settings.context_window_tokens）；装配层据此 model_copy 出中间件专用配置，
+    # 不动通用 worker 的默认值。
+    context_window_tokens: int = 0
 
 
 # ---------------------------------------------------------------- 工具集
-def _general_tools(*, settings: Settings, task: TaskSpec, redis_client: Any = None) -> list[Any]:
-    # 区域模型：可玩耍区（play_root）读写删全开；Desktop/Downloads/Documents 与附件目录只读。
+def _worker_tools(
+    *,
+    settings: Settings,
+    task: TaskSpec,
+    read_roots: list[Path],
+    write_roots: list[Path],
+) -> list[Any]:
+    """general / memory_consolidate 共用的工具装配：fs + shell + web。"""
     play_root = settings.play_root_path
     tools = build_fs_tools(
         workspace_root=play_root,
         tool_outputs_dir=settings.tool_outputs_dir,
-        read_roots=[*settings.readonly_root_paths, settings.inbox_dir],
-        write_roots=[play_root],
+        read_roots=read_roots,
+        write_roots=write_roots,
     )
     tools.extend(
         build_shell_tools(
@@ -85,15 +92,18 @@ def _general_tools(*, settings: Settings, task: TaskSpec, redis_client: Any = No
             max_content_chars=settings.worker_web_content_chars,
         )
     )
-    tools.append(new_context)
-    # §7.5 B1：worker 也能按需加载技能（目录每次调用重扫，加技能 = 加文件）。
-    tools.extend(build_skill_tools(registry=SkillRegistry(settings.skills_dir), role="worker"))
+    # 上下文管理全被动（WorkerCompactMiddleware 自动压缩），不再暴露主动 new_context 工具。
     return tools
 
 
-def _memory_tools(*, settings: Settings, task: TaskSpec, redis_client: Any = None) -> list[Any]:
-    # 通用 fs 工具受 workspace_root 限制，够不到 memory/ 目录，这里换成专用工具。
-    return build_memory_worker_tools(settings)
+def _general_tools(*, settings: Settings, task: TaskSpec, redis_client: Any = None) -> list[Any]:
+    # 区域模型：可玩耍区（play_root）读写删全开；Desktop/Downloads/Documents 与附件目录只读。
+    return _worker_tools(
+        settings=settings,
+        task=task,
+        read_roots=[*settings.readonly_root_paths, settings.inbox_dir],
+        write_roots=[settings.play_root_path],
+    )
 
 
 def _memory_prompt(settings: Settings) -> str:
@@ -135,9 +145,13 @@ _REGISTRY: dict[str, TaskKindSpec] = {
     "memory_consolidate": TaskKindSpec(
         kind="memory_consolidate",
         system_prompt=_memory_prompt,
-        build_tools=_memory_tools,
+        # 与 general 同一套通用工具（§7 已定方向）：PLAY_ROOT=D:\ 生效后 memory 区
+        # 就在 fs 合法写路径内；写边界靠专属提示词约定，不靠工具集隔离。
+        build_tools=_general_tools,
         default_cwd=lambda s: s.router_dir,
-        note="记忆整理 worker（设计 §3.4 / D8）",
+        # 大量读入 transcript → 预算提到 50w（§7-3，DeepSeek 百万窗口）。
+        context_window_tokens=500_000,
+        note="记忆整理 worker（MEMORY_DESIGN §7）",
     ),
     "cua": TaskKindSpec(
         kind="cua",

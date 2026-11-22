@@ -62,6 +62,11 @@ def check_raises(name: str, fn) -> None:
         check(name, False, "未抛 ValueError")
 
 
+def strip_gutter(text: str) -> str:
+    """剥掉 Read 注入的 `<6 位右对齐行号>→` 前缀，还原文件原文。"""
+    return "".join(re.sub(r"^\s{0,6}\d+→", "", line) for line in str(text).splitlines(keepends=True))
+
+
 def main() -> int:
     base = Path(tempfile.mkdtemp(prefix="check_fs_"))
     ws = base / "workspace"
@@ -105,7 +110,8 @@ def main() -> int:
         res,
     )
     check("Write 自动创建父目录", (ws / "notes" / "hello.txt").is_file())
-    check("Read 文本往返一致", read.invoke({"path": "notes/hello.txt"}) == content)
+    got = read.invoke({"path": "notes/hello.txt"})
+    check("Read 文本往返一致（剥行号后）", strip_gutter(got) == content, got)
 
     write.invoke({"path": "notes/crlf.txt", "content": "a\r\nb\r\n"})
     check(
@@ -113,12 +119,22 @@ def main() -> int:
         (ws / "notes" / "crlf.txt").read_bytes() == b"a\r\nb\r\n",
         (ws / "notes" / "crlf.txt").read_bytes(),
     )
-    check("Read 保留 CRLF", read.invoke({"path": "notes/crlf.txt"}) == "a\r\nb\r\n")
+    got = read.invoke({"path": "notes/crlf.txt"})
+    check("Read 保留 CRLF（剥行号后）", strip_gutter(got) == "a\r\nb\r\n", got)
+    check(
+        "Read 行号前缀为 6 位右对齐 + →",
+        got.startswith("     1→a\r\n     2→b\r\n"),
+        got,
+    )
 
     ten = "".join(f"line{i}\n" for i in range(10))
     write.invoke({"path": "notes/ten.txt", "content": ten})
     out = read.invoke({"path": "notes/ten.txt", "offset": 2, "limit": 3})
-    check("Read offset/limit 取第 3-5 行", isinstance(out, str) and out.startswith("line2\nline3\nline4\n"), out)
+    check(
+        "Read offset/limit 取第 3-5 行且行号按真实行号递增",
+        isinstance(out, str) and out.startswith("     3→line2\n     4→line3\n     5→line4\n"),
+        out,
+    )
     check("Read 截断时提示续读 offset", isinstance(out, str) and "offset=5" in out, out)
 
     res = read.invoke({"path": "notes/ten.txt", "offset": 99})
@@ -146,6 +162,60 @@ def main() -> int:
         and artifact.parent.resolve() == outputs.resolve()
         and len(artifact.read_text(encoding="utf-8").splitlines()) == 2000,
         artifact,
+    )
+    check(
+        "Read 落盘的 artifact 保留原文、不带行号前缀",
+        artifact.is_file()
+        and artifact.read_text(encoding="utf-8").startswith("x" * 100),
+        artifact,
+    )
+    check(
+        "Read stub 的头尾带行号前缀",
+        "     1→" in str(stub) and "  2000→" in str(stub),
+        str(stub)[:400],
+    )
+
+    # ---------------------------------------------------------------- 大文件流式读取（>8MB）
+    # 每行 100 字节 × 9 万行 ≈ 8.6 MB，超过 READ_FULL_DECODE_BYTES，必须走流式分支
+    huge = ws / "notes" / "huge.txt"
+    with open(huge, "w", encoding="utf-8", newline="") as fh:
+        for i in range(90_000):
+            fh.write(f"{i:05d}" + "y" * 94 + "\n")
+    check("大文件测试样本 > 8MB", huge.stat().st_size > 8 * 1024 * 1024, huge.stat().st_size)
+
+    out = read.invoke({"path": "notes/huge.txt", "offset": 50_000, "limit": 2})
+    check(
+        "Read >8MB 文件流式取窗口（行号与 offset 对齐）",
+        isinstance(out, str)
+        and out.startswith(" 50001→50000" + "y" * 94 + "\n 50002→50001"),
+        str(out)[:160],
+    )
+    tail_out = read.invoke({"path": "notes/huge.txt", "offset": 89_998, "limit": 5})
+    check(
+        "Read >8MB 文件读到尾部时不报截断、行号收在末行",
+        isinstance(tail_out, str)
+        and "[已截断]" not in tail_out
+        and tail_out.rstrip().endswith(" 90000→89999" + "y" * 94),
+        str(tail_out)[:240],
+    )
+    res = read.invoke({"path": "notes/huge.txt", "offset": 200_000})
+    check(
+        "Read >8MB 文件 offset 越界仍返回 offset_out_of_range",
+        isinstance(res, dict) and res.get("error_class") == "offset_out_of_range",
+        res,
+    )
+
+    # GBK 大文件：不能按 UTF-8 强读，否则整窗变替换符（审计 P2-9）
+    gbk_huge = ws / "notes" / "gbk_huge.txt"
+    with open(gbk_huge, "w", encoding="gbk", newline="") as fh:
+        for i in range(360_000):
+            fh.write(f"{i:06d} 中文日志内容测试\n")
+    check("GBK 大文件样本 > 8MB", gbk_huge.stat().st_size > 8 * 1024 * 1024, gbk_huge.stat().st_size)
+    out = read.invoke({"path": "notes/gbk_huge.txt", "offset": 359_998, "limit": 2})
+    check(
+        "Read >8MB GBK 文件按 gb18030 解码（无替换符）",
+        isinstance(out, str) and "中文日志内容测试" in out and "\ufffd" not in out,
+        str(out)[:160],
     )
 
     # ---------------------------------------------------------------- Edit
@@ -183,6 +253,26 @@ def main() -> int:
     check(
         "Edit replace_all 后原文不再存在",
         "beta" not in (ws / "notes" / "edit.txt").read_text(encoding="utf-8"),
+    )
+
+    # 行号前缀被一起复制进 old_string：工具剥离前缀后仍能命中（否则注入行号会反噬编辑）
+    write.invoke({"path": "notes/numbered.txt", "content": "alpha\nbeta\n"})
+    res = edit.invoke(
+        {
+            "path": "notes/numbered.txt",
+            "old_string": "     2→beta\n",
+            "new_string": "     2→BETA\n",
+        }
+    )
+    check(
+        "Edit old_string 误带行号前缀时自动剥离并命中",
+        isinstance(res, dict) and res.get("ok") is True and res.get("stripped_line_numbers") is True,
+        res,
+    )
+    check(
+        "Edit 剥离行号后写回内容不含前缀",
+        (ws / "notes" / "numbered.txt").read_text(encoding="utf-8") == "alpha\nBETA\n",
+        (ws / "notes" / "numbered.txt").read_text(encoding="utf-8"),
     )
 
     bom_file = ws / "notes" / "bom.txt"
@@ -250,6 +340,28 @@ def main() -> int:
     check(
         "Glob 截断追加提示行",
         isinstance(res, list) and len(res) == 2 and res[-1].startswith("[已截断]"),
+        res,
+    )
+
+    # P1-3：`Path.glob()` 会把 pattern 里的 `..` 真的解析成上级目录，借此可列出
+    # 工作区外的文件名（实测 `../*` 能列到同级目录全部文件）。必须整段拒绝。
+    for bad in ("../*", "../../*", "**/../../*", "..", "..\\*", ".. /x", "proj/../../*"):
+        res = glob.invoke({"pattern": bad, "path": "proj"})
+        check(
+            f"Glob 拒绝穿越 pattern {bad!r}",
+            isinstance(res, dict) and res.get("error_class") == "invalid_pattern",
+            res,
+        )
+    res = glob.invoke({"pattern": str(base / "*.txt")})
+    check(
+        "Glob 拒绝工作区外的绝对 pattern",
+        isinstance(res, dict) and res.get("error_class") == "invalid_pattern",
+        res,
+    )
+    res = glob.invoke({"pattern": str(proj / "*.py")})
+    check(
+        "Glob 允许工作区内的绝对 pattern",
+        isinstance(res, list) and any(p.endswith("a.py") for p in res),
         res,
     )
 
@@ -384,8 +496,13 @@ def main() -> int:
     from agents.vision import INJECT_MAX_IMAGES as _MAXI
 
     cap_msgs: list = []
+    from PIL import Image as _CapImage  # 每张图内容必须不同，否则按 data URL 去重会合并成 1 张
+    import io as _cap_io
+
     for i in range(_MAXI + 3):
-        (img_dir / f"cap_{i}.png").write_bytes(png)
+        buf = _cap_io.BytesIO()
+        _CapImage.new("RGB", (2, 2), (i * 20 % 256, 60, 120)).save(buf, format="PNG")
+        (img_dir / f"cap_{i}.png").write_bytes(buf.getvalue())
         ref = read.invoke({"path": f"img/cap_{i}.png"})[0]["text"]
         cap_msgs.append(_NS(content=[{"type": "text", "text": ref}]))
     injected = _inject(cap_msgs)
@@ -420,7 +537,7 @@ def main() -> int:
     g_read, g_write, g_edit, g_delete, g_glob, g_grep = guarded
 
     res = g_read.invoke({"path": str(inbox / "报告.txt")})
-    check("只读白名单 Read 可读附件文本", res == "附件正文\n", res)
+    check("只读白名单 Read 可读附件文本（剥行号后）", strip_gutter(res) == "附件正文\n", res)
     res = g_read.invoke({"path": str(inbox / "img_abc.png")})
     check(
         "只读白名单 Read 图片同样只回引用文本",
@@ -527,6 +644,19 @@ def main() -> int:
             isinstance(res, dict) and res.get("error_class") == "path_outside_workspace",
             res,
         )
+        # P1-3 第二道闸：即便 pattern 合法，经符号链接目录逃到工作区外的结果也要被过滤
+        link_dir = ws / "link_dir"
+        try:
+            os.symlink(base, link_dir, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pass
+        else:
+            res = glob.invoke({"pattern": "**/*.txt"})
+            check(
+                "Glob 过滤符号链接目录逃逸出的结果",
+                isinstance(res, list) and not any("link_dir" in p for p in res),
+                res,
+            )
 
     check("Write/Edit 不残留临时文件", not list(ws.rglob("*.tmp")), list(ws.rglob("*.tmp")))
 

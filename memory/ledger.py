@@ -3,11 +3,12 @@
 约定（与 `memory/jsonl.py` 一致，只追加不改写）：
 
 - 记账记录写进 `turns-*.jsonl`，与对话流水共用同一个单调 `seq` 空间；
-- `compact`：上下文折叠/压缩发生时追加，写明覆盖的 seq 区间与折叠边界，
-  `summary_ref` 指向替代该区间的摘要版本；
+- `compact`：上下文折叠/压缩发生时追加，写明覆盖的 seq 区间与折叠边界
+  （被动安全网；夜间时间戳折叠不走这里，见 MEMORY_DESIGN §8.2）；
 - `consolidated`：记忆整理 worker 完成后由 **router** 回写（worker 不直接写流水，
-  避免两个进程同时追加导致 `seq` 撞号）；
-- 读取方遇到 `compact` 跳过 `covers_seq` 区间、改用 `summary_ref`；
+  避免两个进程同时追加导致 `seq` 撞号）；按天记账，抄 worker 的 v2 标记
+  （consolidated_day / threads_file / pages_touched），不再有 seq 游标与 summary 版本；
+- 读取方遇到 `compact` 跳过 `covers_seq` 区间；
   `query_records()` 默认不返回这两类元记录，需要时传 `include_meta=True`。
 
 本模块只依赖标准库与 `memory/jsonl.py`。
@@ -82,7 +83,7 @@ def _in_time_range(record: dict, since_ts: str, until_ts: str) -> bool:
 
 def _search_text(record: dict) -> str:
     parts: list[str] = []
-    for key in ("digest", "reply", "reason", "summary_ref", "task_id", "chat_id", "trace_id", "text"):
+    for key in ("digest", "reply", "reason", "task_id", "chat_id", "trace_id", "text", "consolidated_day", "threads_file"):
         value = record.get(key)
         if isinstance(value, str):
             parts.append(value)
@@ -117,12 +118,6 @@ def save_state(directory: Path, updates: dict[str, Any]) -> dict[str, Any]:
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, path)
     return state
-
-
-def current_summary_ref(directory: Path) -> str:
-    """当前摘要版本引用（`memory/summary.md#vN`）；尚未整理时返回空串。"""
-    version = int(load_state(directory).get("summary_version") or 0)
-    return f"memory/summary.md#v{version}" if version else ""
 
 
 def consolidation_report_path(directory: Path) -> Path:
@@ -164,18 +159,6 @@ def last_compact_cursor(directory: Path) -> int:
     cursor = 0
     for record in iter_records(directory):
         if record.get("type") != "compact":
-            continue
-        covers = record.get("covers_seq")
-        if isinstance(covers, list) and len(covers) == 2 and isinstance(covers[1], int):
-            cursor = max(cursor, covers[1])
-    return cursor
-
-
-def last_consolidated_seq(directory: Path) -> int:
-    """已整理进记忆的最后一个 seq（`consolidated` 记录与 `state.json` 取较大者）。"""
-    cursor = int(load_state(directory).get("last_consolidated_seq") or 0)
-    for record in iter_records(directory):
-        if record.get("type") != "consolidated":
             continue
         covers = record.get("covers_seq")
         if isinstance(covers, list) and len(covers) == 2 and isinstance(covers[1], int):
@@ -233,7 +216,6 @@ def append_compact(
     tokens_before: int = 0,
     tokens_after: int = 0,
     upto_seq: int = 0,
-    summary_ref: str = "",
 ) -> int:
     """追加一条 `compact` 记账，返回它的 seq。
 
@@ -246,7 +228,6 @@ def append_compact(
     record = {
         "type": "compact",
         "covers_seq": covers,
-        "summary_ref": summary_ref,
         "reason": reason,
         "boundary_checkpoint_id": boundary_checkpoint_id,
         "removed_messages": int(removed_messages),
@@ -260,20 +241,20 @@ def append_consolidated(
     directory: Path,
     *,
     task_id: str,
-    covers_seq: list[int] | None,
-    summary_ref: str = "",
-    summary_version: int = 0,
-    facts_written: int = 0,
-    decisions_written: int = 0,
+    consolidated_day: str = "",
+    threads_file: str = "",
+    pages_touched: list[str] | None = None,
 ) -> int:
-    """追加一条 `consolidated` 记账（记忆整理完成后由 router 回写）。"""
+    """追加一条 `consolidated` 记账（记忆整理完成后由 router 回写）。
+
+    MEMORY_DESIGN §8.2：整理以**天**为单位（不再是 seq 游标 / summary 版本）；
+    字段直接抄 worker 写的 v2 `last-consolidation.json` 标记，供控制台与对账展示。
+    """
     record = {
         "type": "consolidated",
         "task_id": task_id,
-        "covers_seq": list(covers_seq or []),
-        "summary_ref": summary_ref,
-        "summary_version": int(summary_version),
-        "facts_written": int(facts_written),
-        "decisions_written": int(decisions_written),
+        "consolidated_day": str(consolidated_day or ""),
+        "threads_file": str(threads_file or ""),
+        "pages_touched": [str(p) for p in (pages_touched or [])],
     }
     return JsonlWriter(Path(directory), "turns").append(record)

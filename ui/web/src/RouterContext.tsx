@@ -44,7 +44,16 @@ function Turns() {
           <div className="turn-head">
             <span className="mono dim">#{t.seq}</span>
             <span className="dim">{fmtDateTime(t.ts)}</span>
-            {t.tool_calls.map((name, i) => <span className="tool-chip" key={i}>{name}</span>)}
+            {t.tool_calls.map((c, i) => (
+              <span
+                className="tool-chip"
+                key={i}
+                title={`${c.args_hash} · ${c.ms}ms · ${c.ok ? "ok" : "failed"}`}
+                style={{ borderColor: c.ok ? undefined : "var(--red-bd)", color: c.ok ? undefined : "var(--red)" }}
+              >
+                {c.name}{c.ms > 0 ? <span className="dim" style={{ marginLeft: 4 }}>·{c.ms}ms</span> : ""}
+              </span>
+            ))}
             {t.tool_calls.length === 0 && <span className="dim small">无工具调用</span>}
             <span className="spacer" />
             <span className="dim small mono">{t.chat_id ? t.chat_id.slice(0, 12) + "…" : ""}</span>

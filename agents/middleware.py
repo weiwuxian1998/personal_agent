@@ -11,7 +11,7 @@ v1 目前落地了两项：
   `wrap_model_call` 只改请求不写 state）。
 
 其余 middleware（Trace / ToolPolicy / ShellGuard / StopInjection / WorkerInbox /
-Cost / ErrorNormalize）尚未实现，属于批次 B/C；实现时必须严格按
+ErrorNormalize）尚未实现，属于批次 B/C；实现时必须严格按
 §8.3 的顺序插入，不要改变已有序号。
 
 """
@@ -37,13 +37,11 @@ from config import Settings
 logger = logging.getLogger("agents.middleware")
 
 # 跨节点信号必须用**模块级**状态：实测 LangGraph 每个节点在独立的 context 副本里
-# 执行，ContextVar 在「工具节点 set → 模型节点 get」之间不可见（`new_context` 曾因此
-# 永远折叠不了）。router/worker 都是单进程串行跑一轮，模块级状态足够安全。
-# - force：`new_context` 请求的折叠参数，由下一次 `before_model` 消费；
+# 执行，ContextVar 在「工具节点 set → 模型节点 get」之间不可见。
+# router/worker 都是单进程串行跑一轮，模块级状态足够安全。
 # - pending_compact：本轮折叠摘要，main_router 取走后追加 JSONL 记账。
 # - last_boundary：最近一次折叠的边界消息 id（观测用）。
 _FOLD_STATE: dict[str, Any] = {
-    "force": None,
     "pending_compact": None,
     "last_boundary": "",
 }
@@ -135,55 +133,6 @@ class ToolContextMiddleware(AgentMiddleware):
             _TOOL_MS[call_id] = int((time.monotonic() - started) * 1000)
 
 
-_REHYDRATE_FLAG = "context_rehydrate"
-_REHYDRATE_MAX_SUMMARY_CHARS = 6_000
-_REHYDRATE_MAX_FACT_ROWS = 20
-_REHYDRATE_MAX_DECISION_ROWS = 15
-_REHYDRATE_MAX_ROW_CHARS = 160
-
-
-def _clip_row(text: Any, limit: int = _REHYDRATE_MAX_ROW_CHARS) -> str:
-    value = str(text or "").replace("\n", " ").strip()
-    return value if len(value) <= limit else value[:limit] + "…"
-
-
-def _render_rehydrate(reason: str, removed: int, snapshot: dict) -> str:
-    """把折叠信息 + 记忆快照渲染成一次性注入的提醒块。"""
-    parts = [
-        "<system_reminder type='context_rehydrate'>",
-        f"刚发生上下文折叠（原因：{reason}，删除 {removed} 条消息）。"
-        "以下是从记忆目录读取的当前长期记忆快照；细节以落盘文件为准，"
-        "需要原始流水用 ReadRecords 回查，不要凭空补全。",
-    ]
-    summary = str((snapshot.get("summary") or "")).strip()
-    if summary:
-        if len(summary) > _REHYDRATE_MAX_SUMMARY_CHARS:
-            summary = summary[:_REHYDRATE_MAX_SUMMARY_CHARS] + "…（已截断）"
-        parts += ["## 滚动摘要", summary]
-    facts = [row for row in (snapshot.get("facts") or []) if isinstance(row, dict)]
-    if facts:
-        rows = [
-            f"- {_clip_row(row.get('key'))}: {_clip_row(row.get('value'))}"
-            f"（{_clip_row(row.get('confidence'))}）"
-            for row in facts[-_REHYDRATE_MAX_FACT_ROWS:]
-        ]
-        parts += ["## 最近事实", *rows]
-    decisions = [row for row in (snapshot.get("decisions") or []) if isinstance(row, dict)]
-    if decisions:
-        rows = [
-            f"- {_clip_row(row.get('date'))}: {_clip_row(row.get('decision'))}"
-            for row in decisions[-_REHYDRATE_MAX_DECISION_ROWS:]
-        ]
-        parts += ["## 最近决策", *rows]
-    state = snapshot.get("state") or {}
-    parts.append(
-        f"（摘要版本 v{state.get('summary_version') or 0}；"
-        f"记忆覆盖到 seq {state.get('last_consolidated_seq') or 0}）"
-    )
-    parts.append("</system_reminder>")
-    return "\n".join(parts)
-
-
 class ContextBudgetMiddleware(AgentMiddleware):
     """上下文预算与折叠（设计文档 §3.6）。
 
@@ -191,16 +140,15 @@ class ContextBudgetMiddleware(AgentMiddleware):
     - 折叠 = 逐条 `RemoveMessage`（**不是** REMOVE_ALL），保留最近 8 条 /
       40k tokens、最后一条 HumanMessage，且不拆 `tool_calls` 与 `ToolMessage`；
     - 每次折叠把 `boundary_checkpoint_id`（被删的最后一条消息 id）写进
-      `memory/context-boundaries.jsonl`，供后续对账；
-    - **替换式折叠**（仅 router，`rehydrate_memory=True`）：删除的同时追加一条
-      「折叠摘要 + 记忆快照」的 HumanMessage（快照读自 memory/ 目录），只在
-      真正发生删除时注入一次，之后各轮不再动——被删历史被记忆替换，而不是
-      留下空洞；worker 保持默认关闭（worker 上下文随任务结束丢弃，不需要记忆）；
-    - `new_context` 工具通过 `wrap_tool_call` 拦下，置一个 force-fold 信号，
-      由下一次 `before_model` 真正删除（同样走替换路径）。
+      `memory/context-boundaries.jsonl`，供后续对账。
+
+    `new_context` 主动折叠与「记忆快照替换注入」均已删除（MEMORY_DESIGN §8.2 /
+    任务 #7：facts/decisions/summary 废弃）：router 白天不做任何主动裁剪，
+    夜间靠「时间戳折叠 + 记忆注入」（main_router._apply_nightly_fold）刷新；
+    本中间件只剩被动安全网职责，worker 与 router 行为一致。
     """
 
-    def __init__(self, settings: Settings, *, rehydrate_memory: bool = False) -> None:
+    def __init__(self, settings: Settings) -> None:
         super().__init__()
         self._soft = int(settings.context_soft_tokens)
         self._hard = int(settings.context_hard_tokens)
@@ -209,27 +157,6 @@ class ContextBudgetMiddleware(AgentMiddleware):
         self._tool_max_chars = int(settings.context_tool_message_max_chars)
         self._memory_dir = Path(settings.memory_dir)
         self._boundary_path = self._memory_dir / "context-boundaries.jsonl"
-        self._rehydrate_memory = bool(rehydrate_memory)
-
-    def _rehydrate_message(self, *, reason: str, removed: int) -> HumanMessage | None:
-        """读取记忆快照并生成替换块；记忆为空或读失败时跳过（不阻塞折叠）。"""
-        try:
-            # 局部导入避免模块级环（tools.memory → agents.context / tools.shell）。
-            from tools.memory import _memory_snapshot
-
-            snapshot = _memory_snapshot(self._memory_dir)
-        except Exception:  # noqa: BLE001 - 注入失败不能影响折叠本身
-            logger.warning("读取记忆快照失败（折叠继续，跳过替换注入）", exc_info=True)
-            return None
-        if not (
-            str(snapshot.get("summary") or "").strip()
-            or snapshot.get("facts")
-            or snapshot.get("decisions")
-        ):
-            return None
-        message = HumanMessage(content=_render_rehydrate(reason, removed, snapshot))
-        message.additional_kwargs[_REHYDRATE_FLAG] = True
-        return message
 
     # ------------------------------------------------------------------ 内部
     def _record_boundary(
@@ -270,15 +197,16 @@ class ContextBudgetMiddleware(AgentMiddleware):
         messages = list((state or {}).get("messages") or [])
         if not messages:
             return None
-        force = _FOLD_STATE["force"]
         tokens_before = estimate_tokens(messages)
-        if force is None and tokens_before < self._soft:
+        if tokens_before < self._soft:
             return None
 
-        keep_recent, keep_tokens = force if force is not None else (self._keep_recent, self._keep_tokens)
-        cut = compute_cut(messages, keep_recent=keep_recent, keep_recent_tokens=keep_tokens)
+        cut = compute_cut(
+            messages,
+            keep_recent=self._keep_recent,
+            keep_recent_tokens=self._keep_tokens,
+        )
         if cut <= 0:
-            _FOLD_STATE["force"] = None
             return None
 
         removed = messages[:cut]
@@ -296,12 +224,11 @@ class ContextBudgetMiddleware(AgentMiddleware):
             if getattr(m, "id", None)
         ]
         if not removals:
-            _FOLD_STATE["force"] = None
             return None
 
         boundary = str(getattr(removed[-1], "id", ""))
         tokens_after = estimate_tokens(messages[cut:])
-        reason = "new_context" if force is not None else f"budget_soft_{self._soft // 1000}k"
+        reason = f"budget_soft_{self._soft // 1000}k"
         if truncated:
             reason += "+tool_truncate"
         self._record_boundary(boundary, len(removed), tokens_before, tokens_after, reason=reason)
@@ -309,39 +236,7 @@ class ContextBudgetMiddleware(AgentMiddleware):
             "上下文折叠：删除 %d 条（soft=%d hard=%d tokens %d→%d，截断 %d 条工具输出）boundary=%s",
             len(removed), self._soft, self._hard, tokens_before, tokens_after, truncated, boundary,
         )
-        _FOLD_STATE["force"] = None
-        result: dict[str, Any] = {"messages": removals}
-        if self._rehydrate_memory:
-            rehydrate = self._rehydrate_message(reason=reason, removed=len(removed))
-            if rehydrate is not None:
-                result["messages"] = [*removals, rehydrate]
-                logger.info("折叠替换注入：已追加记忆快照（摘要/事实/决策）")
-        return result
-
-    def wrap_tool_call(self, request: Any, handler: Any) -> Any:
-        call = getattr(request, "tool_call", None) or {}
-        name = str(call.get("name") or "") if isinstance(call, dict) else ""
-        if name != "new_context":
-            return handler(request)
-
-        args = (call.get("args") or {}) if isinstance(call, dict) else {}
-        keep_recent = int(args.get("keep_recent") or self._keep_recent)
-        keep_tokens = int(args.get("keep_recent_tokens") or self._keep_tokens)
-        state = getattr(request, "state", None) or {}
-        messages = list(state.get("messages") or []) if isinstance(state, dict) else []
-        cut = compute_cut(messages, keep_recent=keep_recent, keep_recent_tokens=keep_tokens)
-        call_id = str(call.get("id") or "") if isinstance(call, dict) else ""
-
-        if cut <= 0:
-            text = "当前上下文不需要折叠（消息数/预算都还够）。"
-        else:
-            _FOLD_STATE["force"] = (keep_recent, keep_tokens)
-            text = (
-                f"已请求折叠：下一轮模型调用前删除最早 {cut} 条消息，"
-                f"保留最近 {keep_recent} 条 / ≤{keep_tokens} tokens；"
-                "最后一条 HumanMessage 与 tool_call/ToolMessage 成对保留。"
-            )
-        return ToolMessage(content=text, tool_call_id=call_id)
+        return {"messages": removals}
 
 
 _STOP_WRAP_UP = (

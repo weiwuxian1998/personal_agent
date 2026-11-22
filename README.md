@@ -185,7 +185,6 @@ ui/sdk/                TS 客户端 SDK + asst-cli（REST/WS 协议封装）
 ui/web/                React 控制台（Vite；dist 为构建产物）
 scripts/               gateway 运维脚本（Windows）+ 各模块验收脚本
 docs/                  工程契约 / 运维手册 / 排查命令
-skills/                助手技能目录（可为空）
 ```
 
 运行期数据不在仓库内：`DATA_DIR`（默认 `~/.assistant`：SQLite `db/assistant.db`、日志、inbox、workers）与 `WORKSPACE_ROOT`（助手唯一可写区）。

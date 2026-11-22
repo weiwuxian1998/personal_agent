@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
+from typing import Any
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -16,6 +19,38 @@ BASE_DIR = Path(__file__).resolve().parent
 # 凭证只从既有 .env 读取；可用 ASSISTANT_ENV_FILE 指向仓库外的凭证文件，
 # 避免把真实密钥复制进新仓库（复制本身也违反"不提交密钥"的约束）。
 ENV_FILE = Path(os.getenv("ASSISTANT_ENV_FILE", str(BASE_DIR / ".env")))
+
+_WIN_ENV_VAR = re.compile(r"%([A-Za-z_][A-Za-z0-9_]*)%")
+
+
+def _expand_path(value: Any) -> Any:
+    """展开路径里的 `~` / `%USERPROFILE%` / `%VAR%`，返回 `Path`。
+
+    pydantic 对 `Path` 字段只做 `Path(value)`，**不会**展开变量。如果 `.env`
+    里写 `%USERPROFILE%\\.assistant`，会被原样当成一个名为 `%USERPROFILE%`
+    的相对目录，在当前工作目录下静默建错。这里统一展开；变量未定义时直接
+    报错，不让错误路径流进运行期。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, (str, Path)):
+        return value
+    text = os.path.expanduser(str(value).strip())
+    missing: list[str] = []
+
+    def _sub(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in os.environ:
+            missing.append(name)
+            return match.group(0)
+        return os.environ[name]
+
+    text = _WIN_ENV_VAR.sub(_sub, text)
+    if missing:
+        raise ValueError(
+            f"路径中的环境变量未定义: {', '.join(sorted(set(missing)))}（原值 {value!r}）"
+        )
+    return Path(text)
 
 
 class Settings(BaseSettings):
@@ -80,14 +115,22 @@ class Settings(BaseSettings):
     # worker 进程入口；默认用当前解释器（必须是 conda env `feishu`）
     worker_python: str = ""
 
+    @field_validator("data_dir", "workspace_root", mode="before")
+    @classmethod
+    def _expand_run_paths(cls, value: Any) -> Any:
+        """允许 `.env` 用 `%USERPROFILE%\\.assistant` 这类写法。"""
+        return _expand_path(value)
+
     # ---------- Router 运行时 ----------
     router_thread_id: str = "router:main"
     router_idle_exit_s: int = 60
     router_read_block_ms: int = 5000
     batch_debounce_ms: int = 200
     batch_max: int = 10
-    router_recursion_limit: int = 300
-    worker_recursion_limit: int = 300
+    # 单次 invoke 的图步数上限。300 会在"干完活再自查"这类长尾上撞限
+    # （活已做完但 GraphRecursionError 把状态记成 error），故放宽到 1000。
+    router_recursion_limit: int = 1000
+    worker_recursion_limit: int = 1000
     # worker 的 WebSearch 默认值（比 router 更保守，避免工具输出撑爆上下文）
     worker_web_default_count: int = 3
     worker_web_content_chars: int = 2048
@@ -99,6 +142,27 @@ class Settings(BaseSettings):
     tool_output_max_bytes: int = 64 * 1024
     tool_output_head_lines: int = 30
     tool_output_tail_lines: int = 60
+
+    # ---------- Worker 三级上下文压缩（agents/compact.py，对齐 Claude Code 级联） ----------
+    # 所有阈值按 context_window_tokens 的比例计算，随窗口缩放，不写死绝对值。
+    # 有效上下文窗口（比例基准）：30w 有效窗口 × 20% = 6w 的 L2 单批摘要窗口。
+    context_window_tokens: int = 300_000
+    # 触发水位：用量达到窗口 × 0.85 时开始压缩（L1 → L2 → L3 递进）
+    compact_trigger_ratio: float = 0.85
+    # 目标水位：压缩到窗口 × 0.60 为止
+    compact_target_ratio: float = 0.60
+    # L2 单批摘要窗口 = 窗口 × 20%（且至少覆盖 current - target 的超额量）
+    compact_l2_batch_ratio: float = 0.20
+    # 最近 N 轮 AI 交互不压缩（保护区，不拆 tool_call / ToolMessage 配对）
+    compact_protect_rounds: int = 3
+    # L1 截断后的预览长度（字符）
+    compact_preview_chars: int = 2000
+    # 工具输出短于此长度不压（字符）
+    compact_min_compress_chars: int = 800
+    # L2 摘要目标长度（字符）
+    compact_summary_chars: int = 3000
+    # L3 全量摘要目标长度（字符）
+    compact_l3_summary_chars: int = 2000
 
     # 文档 §3.6：上下文预算与折叠（router / worker 共用同一组阈值）
     context_soft_tokens: int = 256_000
@@ -188,11 +252,6 @@ class Settings(BaseSettings):
     @property
     def tool_outputs_dir(self) -> Path:
         return self.data_dir / "tool_outputs"
-
-    @property
-    def skills_dir(self) -> Path:
-        """技能目录：仓库根下的 `skills/`（不存在时 Skill 工具返回空列表）。"""
-        return Path(__file__).resolve().parent / "skills"
 
     @property
     def inbox_dir(self) -> Path:

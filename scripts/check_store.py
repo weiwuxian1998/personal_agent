@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -132,6 +133,37 @@ def check_sqlite(tmp: Path) -> None:
     store.set_schedule_status(sched_cron.id, "paused")
     check("schedule_pause", store.list_schedules(status="paused")[0].id == sched_cron.id)
 
+    # dispatch=worker：gateway 到点直接派 worker，不经过 router（2026-11-22 新增）
+    sched_worker = store.create_schedule(
+        cron="0 4 * * *",
+        prompt="把 {yesterday} 的素材整理成长期记忆",
+        dispatch="worker",
+        task_kind="memory_consolidate",
+        title="记忆整理 {yesterday}",
+    )
+    check(
+        "schedule_dispatch_worker",
+        sched_worker.dispatch == "worker"
+        and sched_worker.task_kind == "memory_consolidate"
+        and sched_worker.title == "记忆整理 {yesterday}",
+        f"{sched_worker.dispatch}/{sched_worker.task_kind}/{sched_worker.title}",
+    )
+    got_worker = store.get_schedule(sched_worker.id)
+    check(
+        "schedule_dispatch_roundtrip",
+        got_worker is not None
+        and got_worker.dispatch == "worker"
+        and got_worker.task_kind == "memory_consolidate",
+        str(got_worker),
+    )
+    try:
+        store.create_schedule(cron="0 4 * * *", prompt="x", dispatch="worker")
+        worker_without_kind_ok = False
+    except ValueError:
+        worker_without_kind_ok = True
+    check("schedule_worker_requires_task_kind", worker_without_kind_ok)
+    store.set_schedule_status(sched_worker.id, "cancelled")
+
     # task_watch 去重 + resolve 后重开
     check("watch_first", store.mark_watch(sid_a, "stalled") == "first")
     check("watch_seen", store.mark_watch(sid_a, "stalled") == "seen")
@@ -166,11 +198,68 @@ def check_sqlite(tmp: Path) -> None:
     count = raw_query(db_path, "SELECT COUNT(*) AS c FROM tool_events")[0]["c"]
     check("tool_events_concurrent", count == 100, f"实际 {count}")
 
-    store.record_cost(trace_id="trace-x", scope="router", model="deepseek-flash",
-                      input_tokens=100, cached_tokens=10, output_tokens=20,
-                      cost_usd=0.0001)
-    cost = raw_query(db_path, "SELECT price_version, ts_utc FROM cost_ledger")[0]
-    check("cost_ledger", cost["price_version"] == "v1" and cost["ts_utc"].endswith("Z"))
+    # 瞬时错误退避：短连接 + WAL 下"最后一个连接关闭删除 -wal/-shm"会让并发写拿到
+    # SQLITE_READONLY（不是锁竞争，busy_timeout 无效），靠 _retry_transient 重做整条事务。
+    from store.sqlite import _is_transient_sqlite_error, _retry_transient  # noqa: E402
+
+    attempt = {"n": 0}
+
+    @_retry_transient
+    def flaky(_self) -> str:
+        attempt["n"] += 1
+        if attempt["n"] < 3:
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+        return "ok"
+
+    check("sqlite_retry_recovers_after_transient", flaky(None) == "ok" and attempt["n"] == 3,
+          f"尝试 {attempt['n']} 次")
+
+    attempt["n"] = 0
+
+    @_retry_transient
+    def always_fails(_self) -> str:
+        attempt["n"] += 1
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    try:
+        always_fails(None)
+    except sqlite3.OperationalError:
+        pass
+    check("sqlite_retry_gives_up_after_3", attempt["n"] == 4, f"尝试 {attempt['n']} 次（应为 1+3）")
+
+    attempt["n"] = 0
+
+    @_retry_transient
+    def business_error(_self) -> str:
+        attempt["n"] += 1
+        raise sqlite3.IntegrityError("UNIQUE constraint failed")
+
+    try:
+        business_error(None)
+    except sqlite3.IntegrityError:
+        pass
+    check("sqlite_retry_skips_business_error", attempt["n"] == 1, f"尝试 {attempt['n']} 次")
+
+    check(
+        "sqlite_transient_classifier",
+        all(
+            _is_transient_sqlite_error(sqlite3.OperationalError(m))
+            for m in ("attempt to write a readonly database", "database is locked",
+                      "unable to open database file")
+        )
+        and not _is_transient_sqlite_error(sqlite3.OperationalError("no such table: x")),
+    )
+
+    # 装饰器别被漏掉：所有写方法都必须带 __wrapped__
+    write_methods = (
+        "init_schema", "upsert_session", "set_pid", "set_status", "set_first_message_at",
+        "touch_session", "create_run", "finish_run", "create_schedule",
+        "update_schedule_after_run", "set_schedule_status", "set_schedule_next_run",
+        "mark_watch", "resolve_watch", "record_tool_event", "create_pending_approval",
+        "decide_approval",
+    )
+    unwrapped = [n for n in write_methods if not hasattr(getattr(Store, n), "__wrapped__")]
+    check("sqlite_write_methods_retry_wrapped", not unwrapped, f"缺少装饰器: {unwrapped}")
 
     # 审批：正常裁决、重复裁决、过期
     token = f"tok-{ulid()}"
@@ -221,6 +310,56 @@ def check_jsonl(tmp: Path) -> None:
     check("jsonl_read_since", [r["seq"] for r in read_records(directory, since_seq=2)] == [3])
     check("jsonl_read_limit", len(list(read_records(directory, limit=2))) == 2)
 
+    # ---- next_seq 的反向扫尾实现（docs/JSONL-WRITE-PERF-2026-11-22.md 方案 C）
+    tail_dir = tmp / "jsonl_tail"
+    tail_dir.mkdir(parents=True, exist_ok=True)
+    with open(tail_dir / "turns-2026-01-01.jsonl", "w", encoding="utf-8") as fh:
+        for i in range(1, 11):
+            fh.write(json.dumps({"v": 1, "seq": i, "ts": "2026-01-01T00:00:00+08:00"}) + "\n")
+    tail_writer = JsonlWriter(tail_dir, "turns")
+    check("jsonl_tail_cross_day", tail_writer.next_seq() == 11, str(tail_writer.next_seq()))
+
+    # 崩溃留下的半行（无换行、JSON 不完整）不能把 seq 算错
+    with open(tail_dir / "turns-2026-01-02.jsonl", "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"v": 1, "seq": 42, "ts": "x"}) + "\n")
+        fh.write('{"v":1,"seq":43,"ts":"x","payload":"半')
+    check("jsonl_tail_partial_line", tail_writer.next_seq() == 43, str(tail_writer.next_seq()))
+
+    # 尾部整段坏数据 → 回退到更早的文件，而不是从 1 重来
+    with open(tail_dir / "turns-2026-01-03.jsonl", "w", encoding="utf-8") as fh:
+        fh.write("not json\n" * 50)
+    check("jsonl_tail_all_bad_fallback", tail_writer.next_seq() == 43, str(tail_writer.next_seq()))
+
+    # 单行远大于初始 8 KB 窗口 → 扩窗后仍取到
+    bigline_dir = tmp / "jsonl_bigline"
+    bigline_dir.mkdir(parents=True, exist_ok=True)
+    with open(bigline_dir / "turns-2026-01-04.jsonl", "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"v": 1, "seq": 7, "ts": "x", "payload": "y" * 12_000}) + "\n")
+    check("jsonl_tail_big_line", JsonlWriter(bigline_dir, "turns").next_seq() == 8)
+
+    check("jsonl_tail_empty_dir", JsonlWriter(tmp / "jsonl_empty", "turns").next_seq() == 1)
+
+    # 性能回归：120 天 × 20 行 × 12 KB ≈ 28 MB，旧实现约 400 ms，新实现应 < 50 ms
+    perf_dir = tmp / "jsonl_perf"
+    perf_dir.mkdir(parents=True, exist_ok=True)
+    for day_idx in range(120):
+        day = datetime(2026, 1, 1) + timedelta(days=day_idx)
+        with open(perf_dir / f"turns-{day.date().isoformat()}.jsonl", "w", encoding="utf-8") as fh:
+            for i in range(20):
+                fh.write(
+                    json.dumps(
+                        {"v": 1, "seq": day_idx * 20 + i + 1, "ts": "x", "payload": "y" * 12_000},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+    perf_writer = JsonlWriter(perf_dir, "turns")
+    started = time.perf_counter()
+    perf_seq = perf_writer.next_seq()
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    check("jsonl_tail_perf_seq", perf_seq == 120 * 20 + 1, str(perf_seq))
+    check("jsonl_tail_perf_under_50ms", elapsed_ms < 50, f"{elapsed_ms:.1f} ms")
+
     # compact / consolidated 记账（设计 §3.2）：只追加、seq 连续、covers_seq 可回读
     from memory import ledger  # noqa: E402
 
@@ -232,17 +371,14 @@ def check_jsonl(tmp: Path) -> None:
         tokens_before=300_000,
         tokens_after=20_000,
         upto_seq=3,
-        summary_ref="memory/summary.md#v1",
     )
     check("jsonl_compact_seq", compact_seq == 4, str(compact_seq))
     consolidated_seq = ledger.append_consolidated(
         directory,
         task_id="01MEMTASK",
-        covers_seq=[1, 3],
-        summary_ref="memory/summary.md#v1",
-        summary_version=1,
-        facts_written=2,
-        decisions_written=1,
+        consolidated_day="2026-11-21",
+        threads_file="threads/threads-2026-11-22.md",
+        pages_touched=["index.md", "user-profile.md"],
     )
     check("jsonl_consolidated_seq", consolidated_seq == 5, str(consolidated_seq))
 
@@ -253,9 +389,18 @@ def check_jsonl(tmp: Path) -> None:
         "jsonl_compact_fields",
         compact["covers_seq"] == [1, 3]
         and compact["boundary_checkpoint_id"] == "msg-42"
-        and compact["reason"] == "budget_soft_256k"
-        and compact["summary_ref"] == "memory/summary.md#v1",
+        and compact["reason"] == "budget_soft_256k",
         str(compact),
+    )
+    consolidated = next(r for r in all_records if r.get("type") == "consolidated")
+    check(
+        "jsonl_consolidated_fields",
+        consolidated["consolidated_day"] == "2026-11-21"
+        and consolidated["threads_file"] == "threads/threads-2026-11-22.md"
+        and consolidated["pages_touched"] == ["index.md", "user-profile.md"]
+        and "summary_version" not in consolidated
+        and "covers_seq" not in consolidated,
+        str(consolidated),
     )
     check("jsonl_meta_append_only", len(path.read_text(encoding="utf-8").splitlines()) == 5)
 
@@ -275,7 +420,6 @@ def check_jsonl(tmp: Path) -> None:
     check("jsonl_read_meta_optin", len(ledger.query_records(directory, include_meta=True)) == 5)
     check("jsonl_read_time_future_empty", ledger.query_records(directory, since_ts="2999-01-01") == [])
     check("jsonl_compact_cursor", ledger.last_compact_cursor(directory) == 3)
-    check("jsonl_consolidated_cursor", ledger.last_consolidated_seq(directory) == 3)
     check("jsonl_pending_turns_zero", ledger.count_turns_after(directory, 3) == 0)
     check("jsonl_pending_turns_all", ledger.count_turns_after(directory, 0) == 3)
 

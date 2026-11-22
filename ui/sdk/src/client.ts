@@ -5,7 +5,7 @@
  */
 
 import type {
-  ClientFrame, ContextPage, CostsResponse, EventsResponse, ListResponse,
+  ClientFrame, ContextPage, EventsResponse, ListResponse,
   LogResponse, PageOpts, ScheduleItem, ServerFrame, SessionsPage,
   SessionDetail, StatusSnapshot, StreamEvent, TurnRecord, InboxRecord, WatchItem,
 } from "./types.js";
@@ -144,10 +144,6 @@ export class AssistantClient {
 
   watches(): Promise<ListResponse<WatchItem>> {
     return this.get("/api/watches");
-  }
-
-  costs(limit = 100): Promise<CostsResponse> {
-    return this.get("/api/costs", { limit });
   }
 
   events(stream: "router" | "outbox" = "router", count = 50): Promise<EventsResponse> {

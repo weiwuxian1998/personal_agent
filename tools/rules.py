@@ -26,6 +26,10 @@ Action = Literal["deny", "need_confirm"]
 # 禁区是**唯一允许硬编码的底线**：这些目录永远不可写、不可删，
 # 即使被 `play_root` 配置成可玩耍区也一律拒绝。不要把它做成配置项。
 # 盘符根只禁"根本身"（否则整块 C: 都不可用，配置 `D:\` 也会被误伤）。
+#
+# 另有一层"源码保护"（`is_source_path`）：助手自身仓库里的**代码与配置**不可写、
+# 不可删；但仓库里的其他数据（logs/、临时文件、dist/、.workbuddy/ 等）不设硬限，
+# 与 play_root 里别的位置一样对待。红线是"别改源码"，不是"仓库不许碰"。
 FORBIDDEN_EXACT: tuple[str, ...] = ("C:\\", "/")
 FORBIDDEN_SUBTREES: tuple[str, ...] = (
     "C:\\Windows",
@@ -50,7 +54,7 @@ MAX_BATCH_FILES = 10
 
 
 class PathForbidden(ValueError):
-    """路径落在禁区（系统目录）：任何写入/删除都必须拒绝。"""
+    """路径落在禁区（系统目录或助手源码）：任何写入/删除都必须拒绝。"""
 
     error_class = "path_forbidden"
 
@@ -60,6 +64,64 @@ def _resolved(path: str | Path) -> Path | None:
         return Path(path).expanduser().resolve()
     except (OSError, RuntimeError, ValueError):
         return None
+
+
+def repo_root() -> Path | None:
+    """本仓库根（`tools/rules.py` 的上一级）；仅用于定位"源码保护"边界。"""
+    try:
+        return Path(__file__).resolve().parents[1]
+    except (OSError, RuntimeError, IndexError):
+        return None
+
+
+# 源码保护：仓库里这些后缀算"代码/配置"，连同源码目录一起不可写、不可删。
+SOURCE_SUFFIXES: tuple[str, ...] = (
+    ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".json", ".toml", ".cfg", ".ini", ".yaml", ".yml",
+    ".ps1", ".cmd", ".bat", ".sh", ".sql", ".md",
+)
+# 仓库内的源码目录：首段路径命中即算源码树。
+SOURCE_DIRS: tuple[str, ...] = (
+    "agents", "tools", "store", "bus", "channel", "memory", "cua", "scripts", "docs",
+)
+# 这些目录是构建产物 / 缓存 / 运行数据，不算源码（否则 npm build、日志、临时文件都写不了）。
+SOURCE_EXCLUDE_DIRS: tuple[str, ...] = (
+    "dist", "node_modules", "__pycache__", ".git", ".workbuddy",
+    "logs", "tool_outputs",
+)
+# 无后缀但属于源码/配置的关键文件（`.env` 里是凭证，绝不能改）。
+SOURCE_FILENAMES: tuple[str, ...] = (
+    ".env", ".env.example", ".gitignore", ".gitattributes",
+    "requirements.txt", "requirements-ui.txt",
+)
+
+
+def is_source_path(path: str | Path) -> bool:
+    """路径是否属于助手自身的**源码**（写/删一律拒绝；其他数据不在此列）。
+
+    判定顺序：
+    1. 不在仓库内 → 不是源码；
+    2. 路径里出现 `dist / node_modules / __pycache__ / .git / .workbuddy / logs /
+       tool_outputs` → 不是源码（构建产物与临时文件必须能写）；
+    3. 文件名命中 `SOURCE_FILENAMES`（`.env` 等）或后缀命中 `SOURCE_SUFFIXES` → 是源码；
+    4. 首段目录命中 `SOURCE_DIRS` → 是源码树（目录本身也算，供递归删除判断）。
+    """
+    resolved = _resolved(path)
+    root = repo_root()
+    if resolved is None or root is None or not _is_under(resolved, root):
+        return False
+    if resolved == root:
+        return True  # 仓库根：递归删掉它等于毁掉全部源码
+    parts = resolved.relative_to(root).parts
+    if any(part.lower() in SOURCE_EXCLUDE_DIRS for part in parts):
+        return False
+    if resolved.name.lower() in SOURCE_FILENAMES:
+        return True
+    if resolved.suffix.lower() in SOURCE_SUFFIXES:
+        return True
+    if parts and parts[0].lower() in SOURCE_DIRS:
+        return True
+    return False
 
 
 def forbidden_roots() -> list[Path]:
@@ -115,10 +177,31 @@ def _is_protected(path: Path, home: Path | None = None) -> bool:
     return any(_is_under(path, root) for root in forbidden_roots())
 
 
-def is_forbidden(path: str | Path) -> bool:
-    """路径是否属于禁区：盘符根按"精确相等"判，系统目录按"子树"判。
+def is_cwd_forbidden(path: str | Path) -> bool:
+    """能否作为进程工作目录：只拒**系统目录子树**（Windows / Program Files /
+    AppData / ProgramData 等）；`%TEMP%` 例外。
 
-    例外：系统临时目录（`%TEMP%`，位于 AppData 之下）是约定的scratch 区，不算禁区。
+    与 `is_forbidden` 的差别（用于 Shell 的 cwd，见审计 P1-5）：
+    - **不拒盘符根**：`PLAY_ROOT` 默认就是 `D:\\`，盘符根当写目标危险，当 cwd 合法；
+    - **不拒助手源码**：在仓库根/子目录跑 git、pytest 是正常用法，源码的写入保护
+      由 fs 工具与 R8 规则负责，不该在 cwd 这一层顺手挡掉。
+    """
+    resolved = _resolved(path)
+    if resolved is None:
+        return False
+    temp_dir = _resolved(tempfile.gettempdir())
+    if temp_dir is not None and _is_under(resolved, temp_dir):
+        return False
+    return any(_is_under(resolved, root) for root in forbidden_roots())
+
+
+def is_forbidden(path: str | Path) -> bool:
+    """路径是否不可写/不可删：系统禁区（盘符根精确判、目录按子树判）+ 仓库源码。
+
+    仓库里只有**源码**受保护（`is_source_path`）；同一仓库内的 logs、临时文件、
+    构建产物照常可写，不做硬限制。
+
+    例外：系统临时目录（`%TEMP%`，位于 AppData 之下）是约定的 scratch 区，不算禁区。
     """
     resolved = _resolved(path)
     if resolved is None:
@@ -128,14 +211,16 @@ def is_forbidden(path: str | Path) -> bool:
         return False
     if any(resolved == root for root in forbidden_exact_roots()):
         return True
-    return any(_is_under(resolved, root) for root in forbidden_roots())
+    if any(_is_under(resolved, root) for root in forbidden_roots()):
+        return True
+    return is_source_path(resolved)
 
 
 def assert_not_forbidden(path: str | Path) -> Path:
     """写/删之前调用；禁区抛 `PathForbidden`，其余原样返回真实路径。"""
     resolved = _resolved(path) or Path(str(path))
     if is_forbidden(resolved):
-        raise PathForbidden(f"路径落在禁区（系统目录），任何写入/删除都被拒绝: {resolved}")
+        raise PathForbidden(f"路径落在禁区（系统目录或助手仓库），任何写入/删除都被拒绝: {resolved}")
     return resolved
 
 
@@ -471,6 +556,14 @@ def _hit_r2(
                 "该命令在个人目录/系统目录上使用宽通配，已被策略拒绝。",
                 "请列出具体文件（可用 Glob 先查看），再逐个处理。",
             )
+        # 源码保护：仓库里的代码/配置与源码目录不可删（非递归删单个源码文件也拒绝）。
+        if is_source_path(path):
+            return RuleHit(
+                "R2",
+                "deny",
+                "该命令会删除助手自身的源码，已被策略拒绝。",
+                "源码不可删；仓库里的产物与临时文件（logs、dist 等）不受此限。",
+            )
         if not recursive:
             continue
         if _is_root_like(path, home=home):
@@ -628,10 +721,23 @@ def _hit_r8(
     roots = write_roots or [workspace_root]
     targets = [a for a in args if not _is_flag(a, command) and _looks_like_path(a)]
     targets.extend(extra_targets)
+    resolved: list[tuple[str, Path]] = []
     for raw in targets:
         path = _resolve(raw, home=home, base=base)
         if path is None or _is_root_like(path, home=home):
             continue  # 根目录交给 R2/R1，不重复判
+        resolved.append((raw, path))
+    # 禁区优先：目标里只要有一个落在系统目录或需保护的源码，直接拒绝（deny 高于 need_confirm）。
+    # 必须先判禁区再判 write_roots——仓库就在 play_root 之内，顺序反了会被 `continue` 放行。
+    for _raw, path in resolved:
+        if is_forbidden(path):
+            return RuleHit(
+                "R8",
+                "deny",
+                "该命令会写入禁区（系统目录或助手源码），已被策略拒绝。",
+                "系统目录与助手源码只允许读；要改代码请在工作区另建副本。",
+            )
+    for _raw, path in resolved:
         if any(_is_under(path, root) for root in roots):
             continue
         return RuleHit(
@@ -662,8 +768,8 @@ def check_command_rules(
 ) -> RuleHit | None:
     """按 R1–R8 对一条命令做确定性判断；无命中返回 None。
 
-    拒绝类（R1/R2/R5/R6/R7）优先于确认类（R3/R4/R8）：同一条命令里既有
-    危险动作又有待确认动作时，直接拒绝，避免"部分执行"。
+    拒绝类（R1/R2/R5/R6/R7，以及 R8 命中禁区的写入）优先于确认类（R3/R4 与 R8 的
+    越界写）：同一条命令里既有危险动作又有待确认动作时，直接拒绝，避免"部分执行"。
     `write_roots` 是可玩耍区（默认 `[workspace_root]`），R8 以它为界判越界写。
     """
     if not command or not command.strip():
@@ -724,7 +830,7 @@ def check_command_rules(
                 write_roots=roots,
             )
             if r8:
-                confirm_hits.append(r8)
+                (deny_hits if r8.action == "deny" else confirm_hits).append(r8)
         r6 = _hit_r6("", [], [segments]) if len(segments) > 1 else None
         if r6:
             deny_hits.append(r6)

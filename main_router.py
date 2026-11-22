@@ -22,10 +22,12 @@ import sys
 import threading
 import time
 import traceback
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any
 
 import redis
+from langchain_core.messages import RemoveMessage, SystemMessage
 
 from agents.base import last_ai_text, stream_agent_steps
 from agents.context import (
@@ -34,6 +36,7 @@ from agents.context import (
     current_message_id,
     current_trace_id,
 )
+from agents.context_budget import nightly_fold_plan, render_memory_injection
 from agents.middleware import reset_tool_ms, take_pending_compact, take_tool_ms
 from agents.router.graph import build_router
 from bus.envelope import (
@@ -45,14 +48,15 @@ from bus.envelope import (
 )
 from bus.stream import Bus
 from config import settings
-from contracts import Event, now_iso, ulid
+from contracts import TZ_SHANGHAI, Event, now_iso, ulid
 from memory.jsonl import JsonlWriter
+from memory.layout import index_path, ledger_dir, threads_dir
 from memory.ledger import (
     append_compact,
     append_consolidated,
     consolidation_report_path,
-    current_summary_ref,
     load_state,
+    save_state,
 )
 from store.checkpointer import open_checkpointer
 from store.sqlite import Store
@@ -156,22 +160,23 @@ def _apply_worker_results(store: Store, events: list[Event]) -> None:
 
 
 def _append_consolidated(task_id: str) -> None:
-    """记忆整理完成后回写 `consolidated` 记账（JSONL 只由 router 追加）。"""
+    """记忆整理完成后回写 `consolidated` 记账（JSONL 只由 router 追加）。
+
+    v2 标记按天记账（MEMORY_DESIGN §8.2）：抄 marker 的 consolidated_day /
+    threads_file / pages_touched；旧 covers_seq / summary_version 已废弃。
+    """
     try:
         report_path = consolidation_report_path(settings.memory_dir)
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        covers = report.get("covers_seq") or []
-        version = int(report.get("summary_version") or 0)
+        day = str(report.get("consolidated_day") or "")
         seq = append_consolidated(
-            settings.memory_dir,
+            ledger_dir(settings),
             task_id=task_id,
-            covers_seq=covers if isinstance(covers, list) else [],
-            summary_ref=f"memory/summary.md#v{version}" if version else "",
-            summary_version=version,
-            facts_written=int(report.get("facts_written") or 0),
-            decisions_written=int(report.get("decisions_written") or 0),
+            consolidated_day=day,
+            threads_file=str(report.get("threads_file") or ""),
+            pages_touched=report.get("pages_touched") or [],
         )
-        logger.info("追加 consolidated 记账 seq=%s 覆盖=%s 摘要 v%s", seq, covers, version)
+        logger.info("追加 consolidated 记账 seq=%s day=%s", seq, day)
     except FileNotFoundError:
         logger.warning("记忆整理任务 %s 完成但没有 last-consolidation.json，未写 consolidated 记账", task_id)
     except Exception:
@@ -394,12 +399,17 @@ def _turn_usage(messages: list[Any]) -> dict[str, int]:
 
 def _turn_context(pending: dict[str, Any] | None) -> dict[str, Any]:
     """本轮上下文状态（不含 dropped_messages，按用户要求）。"""
+    # 记忆游标改为"最近成功整理的日子"（v2 标记；summary_version 已废弃）。
+    memory_day = ""
     try:
-        memory_version = int(load_state(settings.memory_dir).get("summary_version") or 0)
-    except Exception:
-        memory_version = 0
+        marker_path = consolidation_report_path(Path(settings.memory_dir))
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        if isinstance(marker, dict) and marker.get("status") == "done":
+            memory_day = str(marker.get("consolidated_day") or "")
+    except (OSError, json.JSONDecodeError):
+        memory_day = ""
     context: dict[str, Any] = {
-        "memory_version": memory_version,
+        "memory_day": memory_day,
         "compacted_messages": int((pending or {}).get("removed") or 0),
     }
     if pending:
@@ -416,6 +426,102 @@ def _current_checkpoint_id(graph: Any) -> str:
         return str(((config or {}).get("configurable") or {}).get("checkpoint_id") or "")
     except Exception:
         return ""
+
+
+def _apply_nightly_fold(graph: Any, saver: Any) -> None:
+    """启动时应用「昨夜整理成功」→ 时间戳折叠 + 记忆注入（MEMORY_DESIGN §8.2）。
+
+    机械操作、零 LLM 成本：发现 marker（v≥2、status=done、consolidated_day=昨天）
+    就把今天 00:00 之前的消息 + 上次注入块从 checkpoint 删掉，注入
+    handoff + index.md + 最近 3 天 threads。任何一步不满足就安静跳过；
+    异常只 warning，绝不阻断 router 启动（折叠失败无非是上下文长一点）。
+    """
+    if saver is None:
+        return  # 无 checkpoint 模式：没有历史可折叠
+    try:
+        marker_path = consolidation_report_path(Path(settings.memory_dir))
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return  # 没有整理报告（首夜之前）→ 跳过
+        if not isinstance(marker, dict):
+            return
+        if int(marker.get("v") or 0) < 2 or marker.get("status") != "done":
+            return
+        consolidated_day = str(marker.get("consolidated_day") or "")
+
+        now = datetime.now(TZ_SHANGHAI)
+        yesterday = (now.date() - timedelta(days=1)).isoformat()
+        if consolidated_day != yesterday:
+            # marker 比昨天旧：说明有日子没整理，折叠会误删未消化的历史 → 不动。
+            logger.info(
+                "夜间折叠跳过：marker consolidated_day=%s 非昨天 %s（有未整理的日子）",
+                consolidated_day,
+                yesterday,
+            )
+            return
+
+        ledger_root = ledger_dir(settings)
+        if load_state(ledger_root).get("nightly_fold_day") == consolidated_day:
+            return  # 今天已经折叠过（router 重启）→ 幂等跳过
+
+        config = {"configurable": {"thread_id": settings.router_thread_id}}
+        try:
+            snapshot = graph.get_state(config)
+        except Exception:
+            logger.warning("夜间折叠：读取 checkpoint 失败，跳过\n%s", traceback.format_exc())
+            return
+        messages = list((getattr(snapshot, "values", None) or {}).get("messages") or [])
+        if not messages:
+            save_state(ledger_root, {"nightly_fold_day": consolidated_day})
+            return
+
+        cutoff = datetime.combine(now.date(), dtime.min, tzinfo=TZ_SHANGHAI)
+        plan = nightly_fold_plan(messages, cutoff=cutoff)
+
+        index_text = ""
+        try:
+            index_text = index_path(settings).read_text(encoding="utf-8")
+        except OSError:
+            pass
+        threads: list[tuple[str, str]] = []
+        try:
+            files = sorted(threads_dir(settings).glob("threads-*.md"))[-3:]
+            for path in files:
+                try:
+                    threads.append((path.name, path.read_text(encoding="utf-8")))
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        handoff = str(marker.get("handoff") or "")
+        injection = render_memory_injection(
+            handoff=handoff,
+            index_text=index_text,
+            threads=threads,
+            day=consolidated_day,
+        )
+
+        updates: list[Any] = [RemoveMessage(id=mid) for mid in plan.delete_ids]
+        updates.append(
+            SystemMessage(
+                content=injection,
+                additional_kwargs={"created_at": now_iso(), "memory_refresh": True},
+            )
+        )
+        graph.update_state(config, {"messages": updates})
+        save_state(ledger_root, {"nightly_fold_day": consolidated_day})
+        logger.info(
+            "夜间折叠已应用：day=%s 删 %d 条（回吸 %d）、保留 %d 条、注入 index=%dB threads=%d 份",
+            consolidated_day,
+            plan.removed,
+            plan.snapped_back,
+            plan.kept,
+            len(index_text.encode("utf-8")),
+            len(threads),
+        )
+    except Exception:
+        logger.warning("夜间折叠异常，跳过（不影响启动）\n%s", traceback.format_exc())
 
 
 def _process_batch(
@@ -521,14 +627,13 @@ def _process_batch(
     if pending:
         try:
             compact_seq = append_compact(
-                settings.memory_dir,
+                ledger_dir(settings),
                 reason=str(pending.get("reason") or ""),
                 boundary_checkpoint_id=str(pending.get("boundary") or ""),
                 removed_messages=int(pending.get("removed") or 0),
                 tokens_before=int(pending.get("tokens_before") or 0),
                 tokens_after=int(pending.get("tokens_after") or 0),
                 upto_seq=last_seq_before,
-                summary_ref=current_summary_ref(settings.memory_dir),
             )
             logger.info(
                 "追加 compact 记账 seq=%s 覆盖=1..%s 原因=%s boundary=%s",
@@ -574,8 +679,10 @@ def main() -> int:
 
     store = Store(settings.db_path)
     store.init_schema()
-    inbox = JsonlWriter(settings.memory_dir, "inbox")
-    turns = JsonlWriter(settings.memory_dir, "turns")
+    # 记账流水（turns/inbox）与 state.json 游标在 ledger 区——"素材/记账不是记忆"
+    # （MEMORY_DESIGN §4）；memory 区只放记忆本身（index/threads/wiki 页）。
+    inbox = JsonlWriter(ledger_dir(settings), "inbox")
+    turns = JsonlWriter(ledger_dir(settings), "turns")
 
     exit_code = 0
     checkpointer_ctx = None
@@ -611,6 +718,9 @@ def main() -> int:
             checkpointer=saver,
             store=store,
         )
+
+        # §8.2：开始消费事件之前先应用昨夜折叠（机械 update_state，零 LLM 成本）。
+        _apply_nightly_fold(graph, saver)
 
         last_active = time.monotonic()
         pending = bus.claim_pending(min_idle_ms=CLAIM_MIN_IDLE_MS, count=settings.batch_max)

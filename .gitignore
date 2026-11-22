@@ -30,3 +30,6 @@ out/
 .trae/
 .idea/
 .vscode/
+
+# Agent 工具的项目级会话数据（非源码）
+.workbuddy/

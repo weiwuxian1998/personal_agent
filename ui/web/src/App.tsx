@@ -6,16 +6,14 @@ import Overview from "./Overview.js";
 import RouterContext from "./RouterContext.js";
 import Workers from "./Workers.js";
 import Schedules from "./Schedules.js";
-import Costs from "./Costs.js";
 
-type Tab = "overview" | "router" | "workers" | "schedules" | "costs";
+type Tab = "overview" | "router" | "workers" | "schedules";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "overview", label: "总览 / 对话" },
   { key: "router", label: "Router 上下文" },
   { key: "workers", label: "Workers" },
   { key: "schedules", label: "定时任务" },
-  { key: "costs", label: "费用" },
 ];
 
 const svgProps = {
@@ -39,9 +37,6 @@ const ICONS: Record<Tab, ReactNode> = {
   ),
   schedules: (
     <svg {...svgProps}><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 3" /></svg>
-  ),
-  costs: (
-    <svg {...svgProps}><path d="M3 3v18h18" /><path d="M7 14l4-4 3 3 5-6" /></svg>
   ),
 };
 
@@ -97,7 +92,6 @@ export default function App() {
           {tab === "router" && <RouterContext />}
           {tab === "workers" && <Workers events={events} />}
           {tab === "schedules" && <Schedules />}
-          {tab === "costs" && <Costs />}
         </main>
       </div>
     </div>

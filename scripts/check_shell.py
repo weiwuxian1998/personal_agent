@@ -156,6 +156,18 @@ def main() -> int:
         check("cwd.missing", r["ok"] is False and r.get("error_class") == "not_found_path",
               str(r.get("error_class")))
 
+        # P1-5：cwd 原先只校验 is_dir()，`C:/Windows/System32` 可以合法起进程。
+        for bad_cwd in ("C:/Windows/System32", "C:/Windows", "C:/Program Files"):
+            r = run("Write-Output 'should-not-run'", cwd=bad_cwd)
+            check(
+                f"cwd.forbidden({bad_cwd})",
+                r["ok"] is False and r.get("error_class") == "cwd_forbidden",
+                str(r.get("error_class")),
+            )
+        # 反向：盘符根必须放行——PLAY_ROOT 默认就是 `D:\`，general 任务以它为 cwd
+        r = run("(Get-Location).Path", cwd=str(Path.home().anchor))
+        check("cwd.drive_root_allowed", r["ok"] is True, str(r.get("error_class")))
+
         # ---------------------------------------------------------------- 错误分类（真机）
         r = run("__asst_missing_command_xyz__")
         check("error.command_not_found", r.get("error_class") == "command_not_found",

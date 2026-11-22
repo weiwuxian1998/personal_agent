@@ -80,29 +80,6 @@ export interface WatchItem {
   dedupe_key: string;
 }
 
-export interface CostItem {
-  id: string;
-  ts_utc: string;
-  trace_id: string | null;
-  scope: string;
-  model: string;
-  input_tokens: number;
-  cached_tokens: number;
-  output_tokens: number;
-  cost_usd: number;
-  price_version: string;
-}
-
-export interface CostTotal {
-  scope: string;
-  model: string;
-  input_tokens: number;
-  cached_tokens: number;
-  output_tokens: number;
-  cost_usd: number;
-  calls: number;
-}
-
 // ---------------------------------------------------------------- 状态快照
 export interface StreamMetrics {
   xlen: number;
@@ -166,6 +143,13 @@ export interface SessionDetail {
 }
 
 // ---------------------------------------------------------------- JSONL 记账
+export interface TurnToolCall {
+  name: string;
+  args_hash: string;
+  ok: boolean;
+  ms: number;
+}
+
 export interface TurnRecord {
   v?: number;
   seq?: number;
@@ -175,7 +159,7 @@ export interface TurnRecord {
   event_ids: string[];
   digest: string;
   reply: string;
-  tool_calls: string[];
+  tool_calls: TurnToolCall[];
   products?: string[];
   ok: boolean;
 }
@@ -194,7 +178,6 @@ export interface InboxRecord {
 // ---------------------------------------------------------------- REST 返回
 export interface SessionsPage { ok: boolean; total: number; items: SessionItem[] }
 export interface ListResponse<T> { ok: boolean; items: T[] }
-export interface CostsResponse { ok: boolean; items: CostItem[]; totals: CostTotal[] }
 export interface EventsResponse { ok: boolean; stream: string; items: { entry_id: string; event: EventEnvelope }[] }
 export interface LogResponse { ok: boolean; path?: string; size?: number; truncated?: boolean; text?: string; error?: string }
 

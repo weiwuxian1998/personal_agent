@@ -30,7 +30,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$ProjectDir = 'C:\Users\34897\Documents\Trae-CN\temp_20261108_06\personal-assistant'
+$ProjectDir = 'D:\personal_agent'
 $PythonExe  = 'C:\Users\34897\miniconda3\envs\feishu\python.exe'
 $LogFile    = Join-Path $ProjectDir 'logs\gateway-live.log'
 $PidFile    = Join-Path $ProjectDir 'logs\gateway.pid'

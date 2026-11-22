@@ -625,51 +625,27 @@ def main() -> int:
             str(ctx_settings.memory_dir),
         )
 
-        # 替换式折叠（仅 router）：默认关闭 → 折叠只删不注；开启 → 追加记忆快照。
+        # 记忆快照替换注入已删除（MEMORY_DESIGN §8.2 / 任务 #7）：折叠只删不注，
+        # before_model 永不追加 context_rehydrate 消息；夜间刷新走 _apply_nightly_fold。
         check(
-            "context_fold_rehydrate_default_off",
+            "context_fold_no_rehydrate_injection",
             not any(
                 isinstance(m, HumanMessage) and m.additional_kwargs.get("context_rehydrate")
                 for m in removals
             ),
             f"removals={len(removals)}",
         )
-        (ctx_settings.memory_dir / "summary.md").write_text(
-            "用户偏好暗色主题；主项目在 D:\\work。", encoding="utf-8"
-        )
-        rehydrating = ContextBudgetMiddleware(ctx_settings, rehydrate_memory=True)
-        update2 = rehydrating.before_model({"messages": _msg_chain()}) or {}
-        msgs2 = update2.get("messages") or []
-        rehydrate_msgs = [
-            m
-            for m in msgs2
-            if isinstance(m, HumanMessage) and m.additional_kwargs.get("context_rehydrate")
-        ]
         check(
-            "context_fold_rehydrate_appends_snapshot_once",
-            len(rehydrate_msgs) == 1
-            and "滚动摘要" in str(rehydrate_msgs[0].content)
-            and "用户偏好暗色主题" in str(rehydrate_msgs[0].content),
-            f"n={len(rehydrate_msgs)} content={str(getattr(rehydrate_msgs[0], 'content', ''))[:60]}",
+            "context_budget_no_rehydrate_param",
+            "rehydrate_memory" not in ContextBudgetMiddleware.__init__.__code__.co_varnames,
+            str(ContextBudgetMiddleware.__init__.__code__.co_varnames),
         )
 
-        class _Req:
-            tool_call = {"name": "new_context", "args": {"keep_recent": 2}, "id": "call_nc"}
-            state = {"messages": _msg_chain()}
-
-        forced = budget.wrap_tool_call(_Req(), lambda req: None)
+        # new_context 主动折叠已删除（MEMORY_DESIGN §8.2）：ContextBudget 只剩被动安全网。
         check(
-            "new_context_intercepted_not_executed",
-            isinstance(forced, ToolMessage) and "已请求折叠" in str(forced.content),
-            str(getattr(forced, "content", ""))[:80],
-        )
-        forced_removals = (budget.before_model(_Req.state) or {}).get("messages") or []
-        check(
-            "new_context_uses_per_message_removal",
-            bool(forced_removals)
-            and len({r.id for r in forced_removals}) == len(forced_removals)
-            and all(r.id != "__remove_all__" for r in forced_removals),
-            f"removals={len(forced_removals)}",
+            "new_context_intercept_removed",
+            "wrap_tool_call" not in ContextBudgetMiddleware.__dict__,
+            "ContextBudgetMiddleware 不应再拦截 new_context",
         )
 
     # ------------------------------------------------ WorkerInbox / StopInjection / SendMessage（§5.5/§5.6）
@@ -859,75 +835,68 @@ def main() -> int:
 
     from memory import ledger  # noqa: E402
     from memory.jsonl import JsonlWriter  # noqa: E402
-    from tools.memory import build_memory_router_tools, build_memory_worker_tools  # noqa: E402
+    import tools.memory as tools_memory  # noqa: E402
+    from tools.memory import build_memory_router_tools  # noqa: E402
 
-    mem_names = [t.name for t in build_memory_worker_tools(settings)]
+    # 任务 #7：facts/decisions/summary 三件套与 worker 专属工具已废弃，
+    # 记忆整理 worker 用通用 fs + Shell（MEMORY_DESIGN §7）。
     check(
-        "memory_worker_toolset",
-        mem_names == ["ReadTurns", "ReadMemory", "WriteMemory"],
-        str(mem_names),
+        "memory_worker_tools_removed",
+        not hasattr(tools_memory, "build_memory_worker_tools")
+        and not hasattr(tools_memory, "_memory_snapshot"),
+        str([n for n in dir(tools_memory) if n.startswith(("build_", "_memory"))]),
     )
-    router_mem_names = [
-        t.name for t in build_memory_router_tools(settings=settings, session_service=None)
-    ]
+    router_mem_names = [t.name for t in build_memory_router_tools(settings=settings)]
     check(
         "memory_router_toolset",
-        router_mem_names == ["ReadRecords", "ReadMemory", "ConsolidateMemory"],
+        router_mem_names == ["ReadRecords"],
         str(router_mem_names),
     )
 
     with _tempfile.TemporaryDirectory(prefix="mem_check_") as td:
         memory_dir = Path(td) / "memory"
         memory_dir.mkdir(parents=True, exist_ok=True)
-        writer = JsonlWriter(memory_dir, "turns")
+        # turns/inbox 记账与 state.json 游标已迁到 ledger 区（MEMORY_DESIGN §4）。
+        ledger_root = Path(td) / "ledger"
+        ledger_root.mkdir(parents=True, exist_ok=True)
+        writer = JsonlWriter(ledger_root, "turns")
         writer.append({"digest": "用户：我喜欢喝拿铁", "reply": "记住了", "tool_calls": [], "ok": True})
         writer.append({"digest": "用户：周报放在 D:/work", "reply": "收到", "tool_calls": [], "ok": True})
 
         fake_settings = SimpleNamespace(
+            router_dir=Path(td),
             memory_dir=memory_dir,
             tool_outputs_dir=Path(td) / "out",
             tool_output_max_lines=2000,
             tool_output_max_bytes=64 * 1024,
         )
-        read_turns, read_memory, write_memory = build_memory_worker_tools(fake_settings)
-
-        read_all = read_turns.invoke({"since_seq": 0, "until_seq": 0, "limit": 10})
-        check("memory_read_turns", read_all.get("count") == 2, str(read_all)[:160])
-        wrote = write_memory.invoke(
-            {
-                "summary": "用户在整理周报，偏好拿铁。",
-                "facts": [{"key": "coffee", "value": "拿铁", "confidence": "high", "source_turn": 1}],
-                "decisions": [{"decision": "周报统一放 D:/work", "reason": "便于查找"}],
-                "covers_seq": [1, 2],
-            }
+        # consolidated 记账：按天记（抄 v2 标记字段），不再有 covers_seq/summary_version
+        cons_seq = ledger.append_consolidated(
+            ledger_root,
+            task_id="task-1",
+            consolidated_day="2026-11-21",
+            threads_file="threads/threads-2026-11-22.md",
+            pages_touched=["index.md", "user-profile.md"],
+        )
+        meta = [r for r in ledger.iter_records(ledger_root) if r.get("type") == "consolidated"]
+        check(
+            "memory_consolidated_day_based",
+            cons_seq > 0
+            and len(meta) == 1
+            and meta[0].get("consolidated_day") == "2026-11-21"
+            and meta[0].get("threads_file") == "threads/threads-2026-11-22.md"
+            and meta[0].get("pages_touched") == ["index.md", "user-profile.md"]
+            and "summary_version" not in meta[0]
+            and "covers_seq" not in meta[0],
+            str(meta)[:200],
         )
         check(
-            "memory_write_memory",
-            wrote.get("summary_version") == 1
-            and wrote.get("covers_seq") == [1, 2]
-            and wrote.get("facts_written") == 1,
-            str(wrote),
+            "memory_summary_helpers_removed",
+            not hasattr(ledger, "current_summary_ref") and not hasattr(ledger, "last_consolidated_seq"),
+            str([n for n in dir(ledger) if "summary" in n or "consolidated" in n]),
         )
-        snapshot = read_memory.invoke({})
-        check(
-            "memory_readback",
-            "拿铁" in snapshot.get("summary", "")
-            and snapshot.get("facts") and snapshot["facts"][0].get("key") == "coffee"
-            and snapshot.get("decisions"),
-            str(snapshot)[:200],
-        )
-        report = _json.loads((memory_dir / "last-consolidation.json").read_text(encoding="utf-8"))
-        check(
-            "memory_consolidation_report",
-            report.get("covers_seq") == [1, 2] and report.get("summary_version") == 1,
-            str(report),
-        )
-        check("memory_state_cursor", ledger.last_consolidated_seq(memory_dir) == 2)
-        check("memory_after_consolidation_no_pending", ledger.count_turns_after(memory_dir, 2) == 0)
         # router 回读：关键词命中 + 默认跳过元记录
-        records_tool = build_memory_router_tools(
-            settings=fake_settings, session_service=None
-        )[0]
+        records_tool = build_memory_router_tools(settings=fake_settings)[0]
         hit = records_tool.invoke({"query": "拿铁"})
         check("memory_read_records_keyword", hit.get("count") == 1, str(hit)[:160])
 
@@ -983,7 +952,12 @@ def main() -> int:
         )
         read_tool, write_tool, _edit, delete_tool, glob_tool, _grep = fs
         (read_dir / "doc.txt").write_text("只读区正文\n", encoding="utf-8", newline="\n")
-        check("region_read_only_readable", read_tool.invoke({"path": str(read_dir / "doc.txt")}) == "只读区正文\n")
+        got = read_tool.invoke({"path": str(read_dir / "doc.txt")})
+        check(
+            "region_read_only_readable",
+            isinstance(got, str) and got.endswith("只读区正文\n"),
+            str(got)[:80],
+        )
         res = write_tool.invoke({"path": str(read_dir / "x.txt"), "content": "x"})
         check("region_read_only_write_rejected", res.get("error_class") == "path_read_only", str(res))
         check("region_read_only_not_written", not (read_dir / "x.txt").exists())
@@ -1036,7 +1010,8 @@ def main() -> int:
             return "1-1"
 
     fake_bus = _FakeBus()
-    reply_tool = build_reply_user_tool(bus=fake_bus, redis_client=_FakeRedis())
+    fake_redis = _FakeRedis()
+    reply_tool = build_reply_user_tool(bus=fake_bus, redis_client=fake_redis)
     current_chat_id.set("oc_test")
     current_trace_id.set("trace_test")
     items = ["D:/x/report.pdf", "https://example.com/a.html"]
@@ -1050,6 +1025,31 @@ def main() -> int:
     check("reply_empty_rejected", reply_tool.invoke({"text": "   "}).get("error_class") == "empty_text")
     only_files = reply_tool.invoke({"text": "", "products": ["D:/x/a.png"]})
     check("reply_files_only_allowed", only_files.get("ok") is True, str(only_files))
+
+    # 幂等命中：槽位值可能是真实 message_id，也可能是哨兵 "pending"；
+    # 哨兵不能当 message_id 返回（会被 _collect_reply_calls 写进 turns.jsonl），
+    # 且必须保留 slot，router 才能轮询回填真实 id。
+    from bus.envelope import REPLY_IDEM_PREFIX  # noqa: E402
+
+    reply_tool.invoke({"text": "幂等测试", "idempotency_key": "slot_pending"})
+    dup_pending = reply_tool.invoke({"text": "幂等测试", "idempotency_key": "slot_pending"})
+    check(
+        "reply_dedup_pending_no_fake_id",
+        dup_pending.get("deduped") is True
+        and dup_pending.get("message_id") == ""
+        and dup_pending.get("slot") == "slot_pending"
+        and dup_pending.get("queued") is True,
+        str(dup_pending),
+    )
+    fake_redis.store[f"{REPLY_IDEM_PREFIX}slot_pending"] = "om_sent_1"
+    dup_sent = reply_tool.invoke({"text": "幂等测试", "idempotency_key": "slot_pending"})
+    check(
+        "reply_dedup_sent_returns_real_id",
+        dup_sent.get("deduped") is True
+        and dup_sent.get("sent") is True
+        and dup_sent.get("message_id") == "om_sent_1",
+        str(dup_sent),
+    )
 
     # ------------------------------------------------ 定时任务：Schedule 工具
     from datetime import datetime, timedelta, timezone  # noqa: E402
@@ -1120,53 +1120,6 @@ def main() -> int:
         )
         cancelled = schedule.invoke({"action": "cancel", "schedule_id": created["schedule_id"]})
         check("schedule_cancel", cancelled.get("status") == "cancelled")
-
-    # ------------------------------------------------ Skill：技能注册表 + 工具
-    from skills.registry import SkillRegistry  # noqa: E402
-    from tools.skill import build_skill_tools  # noqa: E402
-
-    with _tempfile.TemporaryDirectory(prefix="skill_check_") as td:
-        root = Path(td) / "skills"
-        (root / "shared").mkdir(parents=True)
-        (root / "router-only").mkdir(parents=True)
-        (root / "shared" / "alpha.md").write_text(
-            "---\nname: alpha\ndescription: 公共技能\nscope: both\n---\nALPHA BODY\n", encoding="utf-8"
-        )
-        (root / "router-only" / "beta.md").write_text(
-            "---\nname: beta\ndescription: 只给 router\nscope: router\n---\nBETA BODY\n", encoding="utf-8"
-        )
-        (root / "broken.md").write_text("没有 frontmatter 的文件\n", encoding="utf-8")
-
-        registry = SkillRegistry(root)
-        router_skill = build_skill_tools(registry=registry, role="router")[0]
-        worker_skill = build_skill_tools(registry=registry, role="worker")[0]
-        check("skill_toolset", router_skill.name == "Skill" and worker_skill.name == "Skill")
-
-        router_list = router_skill.invoke({})
-        worker_list = worker_skill.invoke({})
-        check(
-            "skill_list_by_role",
-            sorted(c["name"] for c in router_list) == ["alpha", "beta"]
-            and [c["name"] for c in worker_list] == ["alpha"],
-            str(router_list),
-        )
-        check(
-            "skill_broken_skipped",
-            sorted(c.name for c in registry.cards()) == ["alpha", "beta"],
-            str([c.name for c in registry.cards()]),
-        )
-        loaded = router_skill.invoke({"name": "alpha"})
-        check("skill_load_body", loaded.strip() == "ALPHA BODY", str(loaded))
-        denied = worker_skill.invoke({"name": "beta"})
-        check(
-            "skill_scope_denied",
-            denied.get("error_class") == "skill_unavailable" and "alpha" in (denied.get("message") or ""),
-            str(denied),
-        )
-        check(
-            "skill_unknown",
-            router_skill.invoke({"name": "nope"}).get("error_class") == "skill_unavailable",
-        )
 
     # ------------------------------------------------ read_session / TaskOutput：读 checkpoint
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage  # noqa: E402

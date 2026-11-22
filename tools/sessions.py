@@ -179,6 +179,18 @@ class SessionService:
         task_kind: str = "general",
         tools_profile: str = "worker",
     ) -> dict:
+        # 空 prompt 会让 worker 起来后无事可做，且下面取标题会 IndexError；
+        # 在入口按契约返回 error_class，不把原始异常抛给工具层。
+        text_prompt = prompt if isinstance(prompt, str) else ""
+        if not text_prompt.strip():
+            return {
+                "ok": False,
+                "error_class": "empty_prompt",
+                "message": "prompt 为空：必须说明要 worker 做什么。",
+                "hint": "把任务目标、产出与边界写清楚再派发；不要用空白字符串占位。",
+            }
+        prompt = text_prompt
+
         # 类型注册表是唯一事实来源：未知类型在这里显式失败，
         # 不创建会话、不落盘、不拉起进程，也不静默回落到 general。
         try:
@@ -194,7 +206,8 @@ class SessionService:
         except OSError as exc:
             return {"ok": False, "error_class": "cwd_invalid", "message": str(exc)}
 
-        title = (title or prompt.strip().splitlines()[0][:40] or "未命名任务").strip()
+        first_line = prompt.strip().splitlines()[0]
+        title = (title or first_line[:40] or "未命名任务").strip()
         self.store.upsert_session(
             session_id,
             title=title,
@@ -502,27 +515,6 @@ class SessionService:
             "note": "已执行 taskkill /F /T；结果以 worker_result（或缺失）为准。",
         }
 
-    def set_session_title(self, session_id: str, title: str) -> dict:
-        sid = _norm_session_id(session_id)
-        session = self.store.get_session(sid)
-        if not session:
-            return {"ok": False, "error_class": "not_found", "message": f"会话不存在: {sid}"}
-        self.store.upsert_session(
-            sid,
-            title=title,
-            status=session.status,
-            cwd=session.cwd,
-            first_message_at=session.first_message_at,
-        )
-        return {"ok": True, "session_id": sid, "title": title}
-
-    def fork_session(self, session_id: str, *, at_message_id: str | None = None) -> dict:
-        return {
-            "ok": False,
-            "error_class": "not_supported",
-            "message": "fork_session 需要 LangGraph checkpoint 复制，v1 端到端阶段未实现。",
-        }
-
 
 def build_session_tools(service: SessionService) -> list[Any]:
     """按契约导出 router 会话工具（最小集）。"""
@@ -588,15 +580,6 @@ def build_session_tools(service: SessionService) -> list[Any]:
         """向某个 worker 追加一条指令（v1 仅写入其指令流，worker 尚未消费）。"""
         return service.send_message_to_session(session_id, text)
 
-    @tool
-    def set_session_title(session_id: str, title: str) -> dict:
-        """修改会话标题。"""
-        return service.set_session_title(session_id, title)
-
-    @tool
-    def fork_session(session_id: str, at_message_id: str | None = None) -> dict:
-        """从某个会话分叉（v1 未实现，返回 not_supported）。"""
-        return service.fork_session(session_id, at_message_id=at_message_id)
 
     return [
         create_session,
@@ -605,6 +588,4 @@ def build_session_tools(service: SessionService) -> list[Any]:
         TaskOutput,
         StopCommand,
         send_message_to_session,
-        set_session_title,
-        fork_session,
     ]

@@ -45,7 +45,7 @@ main_router.py（按需拉起，空闲 60s 退出，thread_id=router:main）
         ├─ XREADGROUP batch → render_digest → create_agent 一轮
         ├─ 工具：ReplyUser（唯一用户出口）/ create_session / send_message_to_session /
         │        list_sessions / read_session / TaskOutput / StopCommand / Schedule /
-        │        Read / Write / Edit / DeleteFile / Shell(≤30s) / Skill / assistant_profile /
+        │        Read / Write / Edit / DeleteFile / Shell(≤30s) / assistant_profile /
         │        set_session_title / fork_session / ToolSearch / DeferExecuteTool
         └─ 一轮结束 → JSONL fsync → XACK → 空闲退出
                      │ create_session: subprocess Popen(worker_runner.py --task <id>)
@@ -53,7 +53,7 @@ main_router.py（按需拉起，空闲 60s 退出，thread_id=router:main）
 worker_runner.py（每任务一进程，跑完即退，thread_id=worker:<task_id>）
         ├─ create_agent + middleware + PostgresSaver
         ├─ 工具：Read/Write/Edit/DeleteFile/Shell(≤600s)/Glob/Grep/SendMessage/
-        │        WebSearch/WebFetch/TodoWrite/new_context/Skill/StopCommand(本进程后台命令)
+        │        WebSearch/WebFetch/TodoWrite/new_context/StopCommand(本进程后台命令)
         └─ 结束 → XADD worker_result{task_id,text} → 退出
 ```
 
@@ -197,7 +197,19 @@ def open_checkpointer(dsn: str, *, min_size=1, max_size=8) -> Iterator[tuple[Con
 ### 5.2 SQLite（`store/sqlite.py`，M-STORE）
 
 配置：`PRAGMA journal_mode=WAL; synchronous=NORMAL; busy_timeout=5000`。  
-**只允许 router 进程写**；worker 只允许调用 `record_tool_event` / `record_cost`（各自短连接）。
+**只允许 router 进程写**；worker 只允许调用 `record_tool_event`（短连接）。
+
+**瞬时错误退避（必须保留）**：所有写方法（`init_schema` / `upsert_session` / `set_*` /
+`create_*` / `update_schedule_after_run` / `mark_watch` / `resolve_watch` /
+`record_tool_event` / `decide_approval`）都带 `@_retry_transient`。原因是短连接 + WAL 的固有竞争：
+某个连接关闭时若成为"最后一个连接"，SQLite 会 checkpoint 并删除 `-wal`/`-shm`，
+另一线程/进程此刻正在打开 shm，就会被判定"数据库被替换"并返回 `SQLITE_READONLY`
+（`attempt to write a readonly database`）。**这不是锁竞争，`busy_timeout` 对它无效**，
+只能换一条新连接重做整条事务。退避 20 / 50 / 120 ms（共 3 次重试），
+仅对 `SQLITE_BUSY(5)` / `SQLITE_LOCKED(6)` / `SQLITE_READONLY(8)` 及
+`unable to open database file` 生效；`IntegrityError` 等业务错误不重试。
+新写的方法必须"整段逻辑都在 `with self._connect()` 内、无外部副作用"，否则不能加该装饰器。
+只读方法不加（实测并发只读 0 失败）。
 
 DDL 必须与下面完全一致（可加索引，不可改字段名/类型）：
 
@@ -223,7 +235,10 @@ CREATE TABLE schedules (
   next_run_utc TEXT, last_run_utc TEXT,
   misfire_grace_s INTEGER NOT NULL DEFAULT 300,
   catch_up TEXT NOT NULL DEFAULT 'once',
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  dispatch TEXT NOT NULL DEFAULT 'router',   -- router: 投 timer 事件；worker: gateway 直发 worker
+  task_kind TEXT,                            -- dispatch=worker 时的 worker 类型
+  title TEXT                                 -- dispatch=worker 时的会话标题
 );
 CREATE INDEX idx_sched_due ON schedules(status, next_run_utc);
 
@@ -236,12 +251,7 @@ CREATE TABLE task_watch (
 );
 CREATE UNIQUE INDEX idx_watch_dedup ON task_watch(dedupe_key);
 
-CREATE TABLE cost_ledger (
-  id TEXT PRIMARY KEY, ts_utc TEXT NOT NULL, trace_id TEXT,
-  scope TEXT NOT NULL, model TEXT NOT NULL,
-  input_tokens INTEGER NOT NULL, cached_tokens INTEGER NOT NULL DEFAULT 0,
-  output_tokens INTEGER NOT NULL, cost_usd REAL NOT NULL, price_version TEXT NOT NULL
-);
+-- cost_ledger 已于 2026-11-22 移除（不再建表）
 
 CREATE TABLE pending_approvals (
   token TEXT PRIMARY KEY, trace_id TEXT, tool TEXT NOT NULL, args_json TEXT NOT NULL,
@@ -302,8 +312,6 @@ class Store:
     def record_tool_event(self, *, trace_id, session_id, tool, ok, duration_ms,
                           shell=None, error_class=None, fingerprint=None,
                           retry_count=0, exit_code=None, args_hash=None) -> None
-    def record_cost(self, *, trace_id, scope, model, input_tokens, cached_tokens,
-                    output_tokens, cost_usd, price_version="v1") -> None
 
     # 审批
     def create_pending_approval(self, *, token, trace_id, tool, args_json, ttl_s=600) -> None
@@ -325,13 +333,18 @@ def next_run_utc_after(cron: str, timezone_name: str, after: datetime | None = N
 ```python
 class JsonlWriter:
     def __init__(self, directory: Path, prefix: str)       # 文件按 Asia/Shanghai 日期旋转
-    def next_seq(self) -> int                              # 扫描现有文件的最大 seq + 1
+    def next_seq(self) -> int                              # 反向读文件尾部取 max(seq) + 1，O(1)
     def append(self, record: dict) -> int                  # 自动补 v/seq/ts；flush+fsync；返回 seq
 def append_turn(turn: dict, *, directory: Path) -> int     # 便捷函数
 def read_records(directory: Path, *, since_seq=0, limit=None) -> Iterator[dict]
 ```
 
 写入必须 `open(..., "a", encoding="utf-8")` + 单行 JSON + `flush()` + `os.fsync()`；**永不回写旧记录**。
+
+`next_seq()` 依赖「seq 全局单调递增 + 只追加不回写」这一不变量：它只反向读今日文件与日期最新文件的
+尾部（8 KB 起，坏行/超长行则扩窗，上限 1 MB），**不遍历历史**——旧实现逐行全扫，一年量级单次 1.5 s
+（见 `docs/JSONL-WRITE-PERF-2026-11-22.md`）。破坏该不变量的改动（例如回填旧记录、改写历史 seq）
+必须同时改回全扫实现，否则会发重复 seq。
 
 ---
 
@@ -425,7 +438,8 @@ def build_shell_tools(*, profile: ToolProfile, workspace_root: Path,
 3. 超时：`TerminateJobObject` 杀整棵树（Job Object `KILL_ON_JOB_CLOSE`），失败兜底 `taskkill /F /T`；
 4. router profile 的 `timeout_ms > 30000` 直接拒绝（`error_class="router_long_command"`，提示派 worker）；worker 上限 600000；
 5. 超过 2000 行或 64 KB（任一）→ 完整输出写 `tool_outputs/sh_<ulid>.txt`，stdout 只留"头 30 + 尾 60 + 统计 + 绝对路径 + Grep/Read 提示"；不做中间省略；
-6. `utils/errors` 的 8 类 `error_class`：`parse_error / command_not_found / permission / encoding / timeout / network / not_found_path / exit_nonzero`；`fingerprint = sha256(shell|规范化命令|error_class|hint_key)[:12]`；
+6. `utils/errors` 的 9 类 `error_class`：`parse_error / command_not_found / permission / encoding / timeout / network / not_found_path / exit_nonzero / cwd_forbidden`；`fingerprint = sha256(shell|规范化命令|error_class|hint_key)[:12]`；
+   其中 `cwd_forbidden` 对应「cwd 落在系统目录」（`is_cwd_forbidden`：Windows / Program Files / AppData / ProgramData 子树，`%TEMP%` 例外）。口径刻意窄于 `is_forbidden`：**盘符根放行**（`PLAY_ROOT` 默认是 `D:\`）、**仓库源码目录放行**（在仓库根跑 git/pytest 属正常用法），源码写入保护由 fs 工具与 R8 负责；
 7. WSL：`["wsl.exe","-e","bash","-lc",script]`；输出含 `\x00` 比例高时按 UTF-16LE 解码。
 
 ### 7.3 文件工具（M-FS）
@@ -440,14 +454,27 @@ def resolve_in_workspace(path: str | Path, root: Path) -> Path    # 越界抛 Va
 
 | 工具 | 入参 | 返回 |
 |---|---|---|
-| `Read` | `path, offset=0, limit=2000, as_="auto"` | 文本：字符串；图片：内容块列表 `[{"type":"text","text":"[图片] <路径>\|mime\|字节"},{"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}]`（png/jpg/jpeg/gif/webp/bmp，≤4 MB；不缩放；`as_="text"` 时图片按二进制拒绝） |
+| `Read` | `path, offset=0, limit=2000, as_="auto"` | 文本：字符串，**每行带 `<6 位右对齐行号>→` 前缀**（如 `     1→import os`，前缀由工具注入、不属于文件内容，`Edit.old_string` 误带时自动剥离后重试）；>8 MB 的文件走**流式逐行**读取（不整体载入内存，窗口累计 >64 KB 转落盘 stub，此时总行数标"未统计"）；图片：内容块列表 `[{"type":"text","text":"[图片] <路径>\|mime\|字节"},{"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}]`（png/jpg/jpeg/gif/webp/bmp，≤4 MB；不缩放；`as_="text"` 时图片按二进制拒绝） |
 | `Write` | `path, content` | `{"ok":True,"bytes":n,"path":绝对路径}`，临时文件 + `os.replace` |
 | `Edit` | `path, old_string, new_string, replace_all=False` | `{"ok":True,"replacements":n}`；`old_string` 不唯一 → `error_class="not_unique"` |
 | `DeleteFile` | `paths: list[str]` | `{"deleted":[...],"failed":[{"path","reason"}]}` |
-| `Glob` | `pattern, path=None, limit=200` | `list[str]`（按 mtime 新→旧；排除 `.git/node_modules/.venv/__pycache__`）；空结果返回 `["[no matches] ..."]`；截断时在**列表末尾追加**一条 `"[已截断] ..."` 字符串项 |
+| `Glob` | `pattern, path=None, limit=200` | `list[str]`（按 mtime 新→旧；排除 `.git/node_modules/.venv/__pycache__`）；空结果返回 `["[no matches] ..."]`；截断时在**列表末尾追加**一条 `"[已截断] ..."` 字符串项；`pattern` 含 `..`、或绝对路径落在搜索根之外 → `error_class="invalid_pattern"`（`Path.glob` 会真解析 `..`，不拦就等于越界列目录） |
 | `Grep` | `pattern, path=None, glob=None, n=True, limit=200` | `"文件:行号: 内容"` 多行字符串；跳过二进制与 >2MB；参数名是 `n`（`-n` 不是合法 Python 标识符），语义等价 `grep -n`；空结果/截断同样以文本提示行追加 |
 
 **不新增** `ListDir` / `SearchFiles` 等同义工具。
+
+#### 7.3.0 行号注入与大文件读取
+
+- 所有文本读取（含只读白名单目录）统一注入行号：`f"{lineno:>6}→{line}"`。行号是**文件真实行号**，
+  `offset` 语义不变（0 起，返回第 `offset+1` 行起），因此 `[已截断] ... offset=N` 可直接续读；
+- 前缀只出现在返回正文与 stub 的头尾；落盘的 `tool_outputs/read_*.txt` 保留**不带行号**的原文，
+  便于 Grep 与后续处理；
+- `Edit` 兜底：`old_string` 一次命中失败时，剥离每行 `^\s{0,6}\d+→` 前缀后重试一次，
+  命中则在返回里附 `stripped_line_numbers: true`——注入行号不能反过来让编辑变难；
+- 大文件（> `READ_FULL_DECODE_BYTES` = 8 MB）走**流式逐行**：先跳过 offset 前的行，再收集窗口，
+  窗口累计字节超过 `READ_MAX_BYTES`（64 KB）即停并转 stub；编码按 `utf-8-sig` → `gb18030`
+  严格试探，都失败才退 `utf-8(replace)`（大日志常是 GBK，不能按 UTF-8 强读）；
+  读到 EOF 时给出精确总行数，否则标「未统计（>8MB 流式读取）」。offset 越界行为不变（`offset_out_of_range`）。
 
 #### 7.3.1 图片与模型能力（**装配层职责，工具层不判断**）
 
@@ -503,7 +530,10 @@ def build_profile_tool(*, profile_path: Path) -> BaseTool
 
 `assistant_profile(action="read|write", field=None, value=None)`：读写 `memory/profile.md`（JSON 段落），返回 profile 或 `{"ok":True}`。
 
-#### `tools/skill.py` + `skills/`（B1）
+#### `tools/skill.py` + `skills/`（B1）—— **已移除（2026-11-22）**
+
+> 本项目不再提供 Skill 机制：`skills/` 包、`Skill` 工具、`Settings.skills_dir` 均已在 2026-11-22 删除。
+> 以下内容仅作历史契约留档，新的实现不要引用。
 
 ```python
 # skills/registry.py
@@ -775,7 +805,7 @@ def compose_system_prompt(*parts: str) -> str
 5. `ShellGuardMiddleware`（wrap_tool_call：错误指纹 3/4/6/12 熔断，仅 worker）
 6. `StopInjectionMiddleware`（worker：`stop_key` 存在时注入收尾指令一次，之后拒绝所有工具）
 7. `WorkerInboxMiddleware`（worker：before_model 非阻塞读 `asst:stream:worker:<task>`，把 `router_message` 追成 `HumanMessage`）
-8. `CostMiddleware`（after_model：记 usage → `cost_ledger`）
+8. ~~`CostMiddleware`（after_model：记 usage → `cost_ledger`）~~ —— 已移除（2026-11-22）
 9. `ErrorNormalizeMiddleware`（wrap_tool_call：把异常转成 `tool_error`，不让图崩）
 10. `ToolContextMiddleware`（wrap_tool_call：把 `tool_call["id"]` 写进 `current_tool_call_id`，
     调用结束 `reset` 恢复；供 `tools/web.py` / `tools/shell.py` 落盘命名使用）
@@ -847,7 +877,7 @@ def build_worker(task: TaskSpec, settings, checkpointer, redis_client) -> Compil
   worker_result 事件：更新 sessions.status / first_message_at（router 的职责，worker 不写业务表）
   chat_id/chat_type/trace_id 从本批用户消息取 → contextvar + asst:router:state.last_chat_id
   graph.invoke({"messages":[{"role":"user","content":render_digest(batch)}]},
-               config={thread_id:"router:main", recursion_limit=30})
+               config={thread_id:"router:main", recursion_limit=1000})
   写 turns-*.jsonl（append+fsync）→ ACK
 ```
 
@@ -951,9 +981,9 @@ def supervisor_loop(settings, bus, store, stop_event)   # 1s 心跳/待处理；
 | `tools/reply.py` | M-ROUTER | channel.base, redis | ❌ | `scripts/check_router_tools.py` |
 | `tools/schedule.py` | M-ROUTER | store | ❌ | 同上 |
 | `tools/profile.py` | M-ROUTER | contracts | ❌ | 同上 |
-| `tools/skill.py` | M-ROUTER | skills.registry | ❌ | 同上 |
-| `skills/registry.py` / `skills/loader.py` | M-ROUTER | 标准库 | ❌ | 同上 |
-| `skills/shared/**`、`skills/router-only/**` | M-ROUTER | — | ❌ | — |
+| ~~`tools/skill.py`~~ | M-ROUTER | skills.registry | ❌ | 已移除（2026-11-22） |
+| ~~`skills/registry.py` / `skills/loader.py`~~ | M-ROUTER | 标准库 | ❌ | 已移除（2026-11-22） |
+| ~~`skills/shared/**`、`skills/router-only/**`~~ | M-ROUTER | — | ❌ | 已移除（2026-11-22） |
 | `agents/router/graph.py` / `prompt.py` / `tools.yaml` | M-ROUTER | agents.base, 上列工具 | ❌ | `scripts/check_router_agent.py` |
 | `tools/message.py` | M-WORKER | redis, envelope | ❌ | `scripts/check_worker_tools.py` |
 | `tools/web.py` | M-WORKER | httpx | ❌ | 同上 |
@@ -1007,7 +1037,7 @@ requirements.txt
 
 | 模块 | 工作树目录 | 分支 | 交付物 | 依赖 |
 |---|---|---|---|---|
-| **M-ROUTER** | `personal-assistant-dev-router` | `feat/router` | `tools/reply.py`、`schedule.py`、`profile.py`、`skill.py`、`skills/**`、`agents/router/**` | M-STORE 的 `Store`/`JsonlWriter`、M-CHANNEL 的 `Channel` |
+| **M-ROUTER** | `personal-assistant-dev-router` | `feat/router` | `tools/reply.py`、`schedule.py`、`profile.py`、`agents/router/**` | M-STORE 的 `Store`/`JsonlWriter`、M-CHANNEL 的 `Channel` |
 | **M-WORKER** | `personal-assistant-dev-worker` | `feat/worker` | `tools/message.py`、`web.py`、`todo.py`、`context_tools.py`、`agents/worker/**` | M-SHELL 的 `stub_text`/错误结构（可先按契约写，再 rebase） |
 | **M-MEMORY** | `personal-assistant-dev-memory` | `feat/memory` | `memory/context.py`、`memory/consolidate.py` | M-STORE 的 `JsonlWriter` |
 
@@ -1032,7 +1062,7 @@ requirements.txt
 | 2 | `check_fs`：写/读/改/删/Glob/Grep；图片返回 data URI 内容块；`../` 越界被拒 | 全过（M-FS 实测 56/56） |
 | 3 | `check_store`：建表、session 生命周期、schedule due、watch 去重、JSONL seq+fsync、Redis PEL 崩溃重放、PG checkpoint 往返 | 全过（M-STORE 交付，脚本 0 failure） |
 | 4 | `check_channel`：console 收发；飞书事件解析 fixture | 全过；真实飞书发送由 `FEISHU_LIVE=1` 门控 |
-| 5 | `check_router_tools`：ReplyUser 幂等（同 key 只发一次）、Schedule 创建/取消、Skill 清单 | 全过 |
+| 5 | `check_router_tools`：ReplyUser 幂等（同 key 只发一次）、Schedule 创建/取消 | 全过 |
 | 6 | `check_worker_tools`：SendMessage notify 立即返回；ask 超时文案；Web 失败结构化 | 全过 |
 | 7 | `check_memory`：预算裁剪保留最后 HumanMessage、tool 成对；折叠切点安全 | 全过 |
 | 8 | `scripts/selfcheck.py`：Redis group、PG checkpoint 读写、SQLite 表、工具路径守卫 | 退出码 0 |

@@ -1,6 +1,6 @@
 # personal-assistant
 
-飞书个人助理：常驻 gateway 接收飞书消息，按需拉起 router（LangGraph + Postgres checkpoint）决策，长任务交给 worker 子进程执行；Redis Streams 做事件总线。附带一个**只读 Web 控制台**，在浏览器里观察会话、任务、定时、成本与网关状态。
+飞书个人助理：常驻 gateway 接收飞书消息，按需拉起 router（LangGraph + Postgres checkpoint）决策，长任务交给 worker 子进程执行；Redis Streams 做事件总线。内置**分层记忆**（index / threads / journal）、**Windows 桌面与浏览器自动化（CUA）**、WebSearch/WebFetch 网络工具，并附带一个**只读 Web 控制台**，在浏览器里观察会话、任务、定时、成本与网关状态。
 
 本文档面向**部署者（人或自动化智能体）**，以 Windows 原生部署为主线，不依赖 Docker / WSL。每一步都给出命令与预期结果，按顺序执行即可。
 
@@ -15,6 +15,12 @@
                      │  派生子进程
                      ▼
               worker_runner.py（每任务一个，长命令 / 浏览器 / 文件操作）
+                     │
+      ┌──────────────┼──────────────┐
+      ▼              ▼              ▼
+  tools/*         cua/*          memory/
+  Shell/fs/Web    Windows 桌面   index.md + threads/
+  Schedule/CUA    与浏览器操控   journal + 素材/记账区
 
 protocol_adapter.py（只读控制台后端，FastAPI + WebSocket，默认 127.0.0.1:8765）
    └── 托管 ui/web/dist 前端；只读 Redis / SQLite / Postgres，无任何写命令
@@ -26,7 +32,7 @@ protocol_adapter.py（只读控制台后端，FastAPI + WebSocket，默认 127.0
 
 | 组件 | 版本要求 | 说明 |
 |---|---|---|
-| OS | Windows 10/11 x64（主线）；Linux/macOS 亦可 | 运维脚本 `scripts/gateway.ps1` 目前仅 Windows |
+| OS | Windows 10/11 x64（主线）；Linux/macOS 亦可 | 运维脚本 `scripts/gateway.ps1` 目前仅 Windows；CUA 桌面操控依赖 Win32/UIA，仅 Windows |
 | Python | **3.11**（实测 3.11.18） | 依赖版本已钉死，勿用未验证的新版本 |
 | Redis | **≥ 7.0 推荐**（硬下限 6.2） | 代码使用 `XAUTOCLAIM`（6.2+）与 `XINFO GROUPS` 的 `lag` 字段（7.0+）。**微软旧版 3.2、tporadowski 5.0 均不可用** |
 | PostgreSQL | 16 推荐 | 只存 LangGraph checkpoint；表首次启动自动创建（幂等迁移） |
@@ -98,7 +104,7 @@ copy .env.example .env
 | `POSTGRES_DSN` | 必填 | 必填 | `postgresql://postgres:你的密码@127.0.0.1:5432/assistant` |
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 不需要 | 必填 | 飞书开放平台 → 应用凭证 |
 | `LLM_API_KEY` | 不需要 | 必填 | DeepSeek key；`LLM_BASE_URL` / `LLM_MODEL` 默认即可 |
-| `DEEPSEEK_SEARCH_API_KEY` | 不需要 | 可选 | 不填则 WebSearch/WebFetch 返回 `not_configured`，不影响其它功能 |
+| `DEEPSEEK_SEARCH_API_KEY` | 不需要 | 可选 | WebSearch/WebFetch 专用（与 LLM key 物理隔离）；不填则返回 `not_configured`，不影响其它功能 |
 | `DATA_DIR` | 可选 | 可选 | 运行数据根目录，默认 `%USERPROFILE%\.assistant`（SQLite、日志、收件箱） |
 | `WORKSPACE_ROOT` | 可选 | 可选 | 助手可写工作区，默认 `%USERPROFILE%\assistant-workspace` |
 
@@ -140,13 +146,13 @@ python protocol_adapter.py
 
 ### 2.7 （可选）完整飞书机器人
 
-1. 飞书开放平台：创建自建应用 → 开启**机器人**能力 → 事件订阅选择**长连接**模式（无需公网 IP），订阅 `im.message.receive_v1`；按功能开通 im 相关发送权限。凭证填入 `.env`。
+1. 飞书开放平台：创建自建应用 → 开启**机器人**能力 → 事件订阅选择**长连接**模式（无需公网 IP），订阅 `im.message.receive_v1`；按功能开通 im 相关发送权限（支持文本 / 图片 / 文件回复与引用回复）。凭证填入 `.env`。
 2. 修改 `scripts\gateway.ps1` 顶部两个变量为你的实际路径：`$ProjectDir`（仓库根目录）、`$PythonExe`（2.3 的解释器绝对路径）。**脚本目前硬编码了原作者机器路径，不改必失败。**
 3. 双击 `scripts\start-gateway.cmd`（等价 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\gateway.ps1 -Action start`）。
 
 **预期**：首次启动 import 约 50–60 秒，日志出现 `connected to wss` 后脚本打印 `READY`，此时可关闭启动窗口（进程经 WMI 脱管，不随终端退出）。
 
-日常运维：`status-gateway.cmd` / `stop-gateway.cmd`；日志 `logs\gateway-live.log`。**严禁同时跑两个 gateway**（飞书长连接对同应用单播分流，多实例表现为随机丢消息）；启动脚本自带单实例检查。详细排查见 `docs/OPERATIONS.md`。
+日常运维：`status-gateway.cmd` / `stop-gateway.cmd`；日志 `logs\gateway-live.log`（`log_rotation.py` 负责轮转）。**严禁同时跑两个 gateway**（飞书长连接对同应用单播分流，多实例表现为随机丢消息）；启动脚本自带单实例检查。详细排查见 `docs/OPERATIONS.md`。
 
 ## 3. 部署验收清单（给自动化智能体）
 
@@ -170,24 +176,29 @@ python protocol_adapter.py
 ## 4. 目录结构
 
 ```
-main_gateway.py        常驻进程：飞书长连接 + outbox 发送 + router 拉起 + 定时/看门狗
-main_router.py         按需决策进程（由 gateway 拉起，勿手动常驻）
-worker_runner.py       长任务子进程（由 router 派生）
+main_gateway.py        常驻进程：飞书长连接 + outbox 发送（含引用回复）+ router 拉起 + 定时/看门狗
+main_router.py         按需决策进程（由 gateway 拉起，勿手动常驻）；业务装配在 agents/router/
+worker_runner.py       长任务子进程（由 router 派生，读 task.json，结果写回 worker_result）
 protocol_adapter.py    只读 Web 控制台后端（FastAPI + WS，自带 __main__）
 config.py              全部配置项（只读 .env / 环境变量）★冻结
 contracts.py           事件/数据契约 ★冻结
+log_rotation.py        日志轮转
 bus/                   Redis Streams 封装 ★envelope.py 冻结
 channel/               飞书 / console 渠道 ★base.py 冻结
-agents/                LangGraph 装配、上下文、视觉 ★context.py/vision.py 冻结
+agents/                LangGraph 装配、上下文预算、压缩、视觉降级 ★context.py/vision.py 冻结
+memory/                记忆层：layout.py（目录布局派生）、jsonl.py（JSONL 写入）、ledger.py（turns/inbox 记账）
 store/                 SQLite（业务表，仅 router 写）+ Postgres checkpointer
-tools/                 助手工具集（Shell/文件/Web/CUA 等）
+tools/                 助手工具集：shell / fs / memory / schedule / sessions / web(WebSearch/WebFetch) / winjob / worker_messages
+cua/                   Windows 计算机操作：screen/input/session（Win32 + UIA + DPI）与 Chromium 浏览器操控
 ui/sdk/                TS 客户端 SDK + asst-cli（REST/WS 协议封装）
 ui/web/                React 控制台（Vite；dist 为构建产物）
-scripts/               gateway 运维脚本（Windows）+ 各模块验收脚本
-docs/                  工程契约 / 运维手册 / 排查命令
+scripts/               gateway 运维脚本（Windows）+ 各模块验收脚本（check_*）
+docs/                  工程契约 / 运维手册 / 记忆设计 / CUA 调研 / 排查命令
 ```
 
 运行期数据不在仓库内：`DATA_DIR`（默认 `~/.assistant`：SQLite `db/assistant.db`、日志、inbox、workers）与 `WORKSPACE_ROOT`（助手唯一可写区）。
+
+记忆层目录由 `memory/layout.py` 统一派生：素材/记账区在 memory 之外（`router/notes/`、`router/transcript/`、`router/ledger/`——素材不是记忆）；记忆区为 `memory/index.md`（≤200 行注入层）、`memory/threads/`、`memory/journal/`、`memory/scratch/`。设计详见 `docs/MEMORY_DESIGN.md`。
 
 ## 5. 常见问题
 
@@ -202,14 +213,16 @@ docs/                  工程契约 / 运维手册 / 排查命令
 | 控制台 Router 显示「待机」黄条 | router 空闲 60s 自动退出属正常；黄条是上次启动失败的历史记录 | 新消息到达会自动重试；traceback 可展开查看 |
 | 收到事件但不回复 | router 消费失败 / 模型报错 | 看 `DATA_DIR/logs/router-*.log` 与 `worker-*.log`；lag 排查见 `docs/OPERATIONS.md` §4 |
 | 重启机器后机器人不工作 | 本方案不做开机自启 | 手动 `start-gateway.cmd`（Redis/PG 若是服务则自启） |
+| WebSearch/WebFetch 返回 `not_configured` | 未配置 `DEEPSEEK_SEARCH_API_KEY` | 在 `.env` 填入该 key（与 `LLM_API_KEY` 物理隔离，不可混用） |
 
 ## 6. 安全与开发约束
 
 - 控制台**只读、无鉴权**：保持 127.0.0.1 绑定；需要远程访问自行加反向代理与鉴权。
 - 密钥只进 `.env`（或 `ASSISTANT_ENV_FILE` 指向的仓库外文件）；日志对 key 脱敏（只显示 `sk-xxxx…末4位`）。不要提交 `.env`、`*.pem`、`*.key` 及任何密钥备份文件。
+- `LLM_API_KEY` 与 `DEEPSEEK_SEARCH_API_KEY` 物理隔离：后者仅供 `/v1/tools/search` 与 `/v1/tools/fetch`，两边代码都不允许 fallback 到对方。
 - 标 ★ 的文件为**冻结契约文件**（`contracts.py`、`config.py`、`bus/envelope.py`、`channel/base.py`、`agents/context.py`、`agents/vision.py`、`requirements.txt`、`.env.example`、`.gitignore`、`docs/ENGINEERING_CONTRACT.md`）：修改须走 `docs/ENGINEERING_CONTRACT.md` §11 变更流程，部署时**不要改**。
 - SQLite 业务表只由 router 写入；控制台以只读模式打开。不要给 Redis 增加新的状态键。
-- 二次开发验收：`scripts/check_contracts.py`、`check_store.py`、`check_adapter.py` 等（需要真实 Redis/Postgres 与运行数据）。
+- 二次开发验收：`scripts/check_contracts.py`、`check_store.py`、`check_memory_p1.py`、`check_shell.py`、`check_fs.py`、`check_web.py`、`check_compact.py` 等（需要真实 Redis/Postgres 与运行数据）。
 
 ## 7. 文档索引
 
@@ -218,4 +231,7 @@ docs/                  工程契约 / 运维手册 / 排查命令
 | `docs/OPERATIONS.md` | Windows gateway 运维手册（启动/停止/日志/三步排查）。注意：其中路径为原作者机器绝对路径，移植时以本文 2.7 为准 |
 | `docs/COMMANDS.md` | Redis/进程排查命令速查（示例基于 WSL redis-cli，原生部署直接用 redis-cli 即可） |
 | `docs/ENGINEERING_CONTRACT.md` | 工程契约：架构、冻结文件、变更流程 |
+| `docs/MEMORY_DESIGN.md` | 记忆层设计：目录布局、注入层、素材/记账区划分 |
+| `docs/CUA_BROWSER_RESEARCH.md` / `CUA_DESKTOP_FEASIBILITY.md` / `CUA_PURE_VISION_RESEARCH.md` / `CUA_UIA_GUIDE.md` | Windows 桌面与浏览器自动化的调研与实现指南 |
+| `docs/PROMPT_PLAN.md` | 提示词规划 |
 | `ui/sdk/`、`ui/web/` | 控制台协议 SDK（含 `asst-cli` 命令行）与前端源码 |

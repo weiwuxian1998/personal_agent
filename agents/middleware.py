@@ -36,6 +36,21 @@ from config import Settings
 
 logger = logging.getLogger("agents.middleware")
 
+
+def _is_multimodal_timeout(exc: BaseException) -> bool:
+    """判断模型调用异常是否为 DeepSeek 多模态图片下载超时。
+
+    这类错误来自 MaaS 代理（如 qianwenaiapi.com）的临时故障：
+    服务端接收到 base64 data URL 后，内部图片预处理超时 → 400。
+    临时跳过图片注入、让 agent 跑完这条消息即可，下一轮自动恢复。
+    """
+    msg = str(exc).lower()
+    return (
+        "multimodal" in msg
+        and ("download failure" in msg or "timeout" in msg)
+    )
+
+
 # 跨节点信号必须用**模块级**状态：实测 LangGraph 每个节点在独立的 context 副本里
 # 执行，ContextVar 在「工具节点 set → 模型节点 get」之间不可见。
 # router/worker 都是单进程串行跑一轮，模块级状态足够安全。
@@ -100,7 +115,23 @@ class VisionAdapterMiddleware(AgentMiddleware):
         messages = [m for m in request.messages if not is_vision_image_context(m)]
         dropped = len(messages) != len(request.messages)
         if self._supports_vision:
-            return handler(request.override(messages=inject_image_blocks(messages)))
+            try:
+                return handler(request.override(messages=inject_image_blocks(messages)))
+            except Exception as exc:
+                if _is_multimodal_timeout(exc):
+                    logger.warning(
+                        "multimodal timeout → fallback without images (supports_vision=False 本轮)"
+                    )
+                    if dropped:
+                        return handler(request.override(messages=messages))
+                    return handler(
+                        request.override(
+                            messages=adapt_messages(
+                                request.messages, supports_vision=False
+                            )
+                        )
+                    )
+                raise
         if dropped:
             return handler(request.override(messages=messages))
         messages = adapt_messages(request.messages, supports_vision=False)

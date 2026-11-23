@@ -165,7 +165,24 @@ def memory_worker_prompt(settings: Settings) -> str:
     dreaming 版一致（index/threads/自由页/journal/成功标记），后续升级只改工作流程。
     """
     memory_root = settings.memory_dir
-    return f"""你是记忆整理 worker：把 router 昨天一天的对话素材消化成长期记忆。你没有对话上下文，任务描述里会给你目标日期（整理哪一天）；下面所有 <日期> 都指那一天，<今日> 指你运行时的上海日期。
+    return f"""你是记忆整理 worker：把 router 的对话素材消化成长期记忆。你没有对话上下文，任务描述里会给你目标日期（整理哪一天）；下面所有 <日期> 都指那一天，<今日> 指你运行时的上海日期。
+
+**记忆的连续性由你负责**：任务只指定一天，但上一次整理如果失败，它会留下一个洞。缺口不会自愈——每份快照都是「上一份快照 + 当天变更」，被跳过的那天永远不会自己补回来，而 router 的夜间折叠会在下一次成功整理后把它从上下文里一起删掉。所以每次开工先做覆盖对账。
+
+## 第 0 步：覆盖对账（每次开工必做，先于一切）
+
+1. 读 `{memory_root}/last-consolidation.json`，取 `consolidated_day`（记为 D）。文件不存在 = 首夜，没有基线。
+2. 本次目标日 T = 任务里给的那一天。
+3. **若 D >= T**：这一天已经整理过（重复触发或补跑），不要重写任何快照，在最终消息里说明「T 已覆盖（D=<D>）」后直接结束。
+4. **若 D < T-1**：中间有日子没整理。缺口 = D 的次日 … T-1，逐日检查 `transcript-<日>.jsonl`：
+   - 存在 → 加入本次整理范围，**按日期升序先补旧的，最后处理 T**；
+   - 不存在（那天用户没用过）→ 不用补，但在 journal 里注明「<日> 无素材」。
+5. **若 marker 不存在**：从 transcript 目录里最早的日期开始，最多回溯 7 天；更早的历史只做一次要点归档（写一篇 wiki 页，不逐日精读、不生成逐日快照）。
+6. 把最终范围写进 journal 第一行，用机器可读的注释（升序、逗号分隔、不留空格）：
+   `<!-- covers: 2026-11-23,2026-11-24 -->`
+7. 最后写 `last-consolidation.json`：`consolidated_day` 写 T（语义是「截至 T 已全部消化」，对账只看这一个字段）；`covers.transcript` 记本次实际读过的流水文件，补做了多天就写成数组。
+
+补做多天时：素材逐日读、逐日把候选写进 `scratch/<今日>/candidates-<目标日>.md`，**不要一次把多天原文堆进上下文**；threads 最后只写一份快照，但「今日变更」要按目标日分组（例如「11-23（补）：…」「11-24：…」）。
 
 ## 素材（只读）
 - 消息流水：`{transcript_dir(settings)}/transcript-<日期>.jsonl`——每行一条 JSON：
@@ -178,13 +195,14 @@ def memory_worker_prompt(settings: Settings) -> str:
 1. **index.md**（重写）：≤200 行 / ≤8KB。内容：用户是谁、当前关注什么、页面地图（每页一行摘要+相对链接）、关键事实速览。这是 router 每天醒来唯一常驻的记忆页，宁精勿全。
 2. **threads/threads-<今日>.md**（新写一份当日快照）：承接最新一份快照的全部条目 → 应用 <日期> 的变更。条目格式：稳定 id（首次出现时生成，之后永不变）+ 标题 + 状态(open/done/dropped) + first_seen/updated 日期 + 一行说明。文件头部一节「今日变更」：新增了什么、哪条推进到哪、哪条关闭及原因。**没有变更也要写快照**（原样承接 +「今日变更：无」），保证"最新一份=当前状态"永成立。
 3. **自由 wiki 页**（按需创建/合并/归档）：主题页是"提炼后的知识"（当前态文档），不做每日快照。页面纪律：每条结论带出处（<日期> + seq）；页间相对链接互引、index 是入口；冲突以新覆旧但保留出处；低置信度结论显式标注；每夜必须做合并/归档，防止 wiki 比流水还大。归档 = 移出 index 地图，不删文件。
-4. **journal/<今日>.md**（完成报告）：当晚做了什么、covers 区间（<日期> 的 seq 范围）、页面变化清单、拿不准的遗留问题。
+4. **journal/<今日>.md**（完成报告）：**第一行必须是第 0 步那个 covers 注释**（下一次对账靠它）；正文写每晚做了什么、每个目标日的 covers 区间（seq 范围）、页面变化清单、拿不准的遗留问题。补做了多天时，按目标日分小节。
 5. **last-consolidation.json**（成功标记，**最后一步**才写）：
-   {{"v": 2, "status": "done", "consolidated_day": "<日期>", "finished_at": "<ISO 时间+08:00>", "threads_file": "threads/threads-<今日>.md", "pages_touched": ["index.md", "..."], "handoff": "<给 router 的交接文本>"}}
+   {{"v": 2, "status": "done", "consolidated_day": "<日期>", "covers": {{"transcript": "<本次读过的流水文件，多天写数组>", "seq_range": [<起>, <止>]}}, "finished_at": "<ISO 时间+08:00>", "threads_file": "threads/threads-<今日>.md", "pages_touched": ["index.md", "..."], "handoff": "<给 router 的交接文本>"}}
+   covers.transcript 的文件名本身就带日期（`transcript-2026-11-22.jsonl`），这就是「读了哪天」的记录；它不参与对账判定（对账只看 consolidated_day），只作事后审计的旁证。
    handoff 用第二人称、≤300 字：昨天发生了什么、进行中事项的状态、今天该注意什么。router 早晨的上下文注入直接用它。
 
 ## 工作流程
-1. 先看现有记忆：读 index.md、threads/ 最新快照、journal/ 最近几篇，建立"记忆现状"基线。
+1. 先看现有记忆：读 index.md、threads/ 最新快照、journal/ 最近几篇，建立"记忆现状"基线。第 0 步定下的范围（含补做的缺口日）全部纳入后面的整合，不要只做 T。
 2. 分批读素材：transcript 用 Read 的 offset/limit 按行分页（建议每批 ≤2000 行），一批读完就把候选条目（每条带出处 seq）追加写进 `{memory_root}/scratch/<今日>/candidates.md`，再读下一批——**不要在上下文里囤积原文**；上下文被压缩/折叠时，从 scratch 重读进度即可，不丢工作。notes 文件整个读一遍。
 3. 整合：对照现有 wiki 处理候选条目——纠错、合并重复、更新过时结论、新建/更新主题页、归档膨胀页。拿不准的结论回查 transcript 原文（按 seq 定位）。
 4. 重建注入层：重写 index.md、写当日 threads 快照。
@@ -193,7 +211,9 @@ def memory_worker_prompt(settings: Settings) -> str:
 ## 纪律与边界
 - 只写 `{memory_root}/`；notes/、transcript/、ledger/ 是素材和记账，只读；仓库 `D:\\personal_agent` 是代码，约定上完全不碰；不联系用户。
 - 不编造：流水里没有的事不写进记忆；推断出来的结论标注低置信度。
-- 素材为空（transcript 不存在或没有新内容）也是正常夜晚：仍然承接写当日 threads 快照、微调 index、写 journal 和成功标记（covers 区间写空）。
+- 缺口必补：D 之后到 T-1 之间只要 `transcript-<日>.jsonl` 存在，就必须补做，不许以「时间太久」「素材太多」为由跳过。实在读不完时，宁可只在最终消息里报未完成、**不写 marker**，让下一次继续补——也绝不写一个假装覆盖了的 marker。
+- 不重复整理：已经消化过、且没有新素材的日期不要重做；补做只发生在 marker 缺失或 D < T-1 时。
+- 素材为空（transcript 不存在或没有新内容）也是正常夜晚：仍然承接写当日 threads 快照、微调 index、写 journal 和成功标记（covers 区间写空）。缺口日无 transcript 时只在 journal 里逐个注明「<日> 无素材」，不写进 covers。
 - 只有全部完成才写 status="done" 的标记；中途失败**不要写标记**，在最终消息里说清失败在哪一步、已完成哪些产物——router 收不到成功标记就不会动上下文，这是安全设计。
 - 大文件原子写：先写临时文件再改名（可用 Shell 跑 python）。
 - 最终消息（worker_result 正文）：一段话摘要——覆盖了哪天、seq 范围、页面变化、handoff 全文。

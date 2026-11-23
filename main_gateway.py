@@ -55,8 +55,19 @@ logger = logging.getLogger("gateway")
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 MAX_CONSECUTIVE_FAILURES = 5
 RETRY_BACKOFF_S = (2, 5, 10, 20, 30)
+# 连续失败到达上限后，等待这么久再重置计数重新尝试。
+# 场景：MaaS 代理临时故障（multimodal download timeout），5 分钟后恢复。
+FAILURE_RESET_S = 300
 
 OUTBOX_SEND_RETRIES = 3
+
+# `_handle` 内部对"发送"重试 3 次；这一层兜的是其余异常（事件解析、Redis 读写、
+# 渠道 SDK 抛错）。个人自用场景，2 次退避足够覆盖网络抖动。
+OUTBOX_HANDLE_RETRIES = 2
+OUTBOX_HANDLE_BACKOFF_S = (0.5, 2.0)
+
+# outbox 发送线程的看护间隔：`run()` 已经不会因单条消息退出，这只是兜底。
+SENDER_WATCH_INTERVAL_S = 20.0
 
 # 同一次触发（schedule_id + 当时算出的 next_run_utc）只允许被一个 gateway 实例投递。
 SCHEDULE_FIRE_PREFIX = "asst:schedule:fire:"
@@ -82,6 +93,12 @@ class OutboxSender(threading.Thread):
         self._reader = read_client
         self._stop_event = threading.Event()
         self._group_ready = False
+        self._dead_letters = 0
+
+    @property
+    def dead_letters(self) -> int:
+        """重试耗尽后被跳过的条数（进程内累计，供日志与联调观察）。"""
+        return self._dead_letters
 
     def _ensure_group(self) -> None:
         try:
@@ -129,7 +146,14 @@ class OutboxSender(threading.Thread):
             text_ok = bool(result is not None and result.ok)
             if text_ok:
                 if key:
-                    self._redis.set(key, result.message_id, xx=True, ex=86400)
+                    # 正文已经发出去了，回填幂等键失败也不能让异常冒出去——
+                    # 冒出去会被 `_dispatch` 当成"没发成功"重试，用户就会收到重复消息。
+                    try:
+                        self._redis.set(key, result.message_id, xx=True, ex=86400)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "outbox 回填 message_id 失败 slot=%s（正文已发送，不回滚）", slot
+                        )
             else:
                 error = (result.error if result else "no_result") or "send_failed"
                 code = result.code if result else None
@@ -195,6 +219,77 @@ class OutboxSender(threading.Thread):
             return False, f"{type(exc).__name__}: {exc}", None
         return result.ok, result.error, result.code
 
+    def _dispatch(self, entry_id: str, fields: dict[str, Any]) -> None:
+        """处理单条 outbox 消息；任何异常都在这里收口。
+
+        这里必须吞掉全部异常：`run()` 是常驻线程，一条消息处理失败若冒出去，
+        整个发送链路会静默死亡（进程、长连接、心跳都还正常），比丢一条消息严重得多。
+        """
+        last: BaseException | None = None
+        for attempt in range(OUTBOX_HANDLE_RETRIES + 1):
+            try:
+                self._handle(entry_id, fields)
+                return
+            except Exception as exc:  # noqa: BLE001 - 一条消息的任何异常都不能退出线程
+                last = exc
+                logger.error(
+                    "outbox 处理异常 entry=%s（第 %d/%d 次）\n%s",
+                    entry_id,
+                    attempt + 1,
+                    OUTBOX_HANDLE_RETRIES + 1,
+                    traceback.format_exc(),
+                )
+                if attempt < OUTBOX_HANDLE_RETRIES:
+                    self._stop_event.wait(OUTBOX_HANDLE_BACKOFF_S[attempt])
+        assert last is not None
+        self._drop_dead_letter(entry_id, fields, last)
+
+    def _drop_dead_letter(self, entry_id: str, fields: dict[str, Any], exc: BaseException) -> None:
+        """重试耗尽：尽力让 router 知道这条没发出去，然后 ACK 出队。
+
+        不 ACK 的话这条会永久占住 PEL（本期没有 XAUTOCLAIM），既堵住
+        `_outbox_pending()` 的判定，也让 `send_once` 永远等不到结束。
+        """
+        self._dead_letters += 1
+        logger.critical(
+            "outbox 死信 entry=%s 已跳过（累计 %d）：%s: %s",
+            entry_id,
+            self._dead_letters,
+            type(exc).__name__,
+            exc,
+        )
+        try:
+            raw = fields.get("data")
+            event = event_from_redis(
+                {"data": raw.decode() if isinstance(raw, bytes) else str(raw)}
+            )
+            payload = event.payload
+            feedback = new_event(
+                "system",
+                "system",
+                {
+                    "kind": "send_failed",
+                    "chat_id": str(payload.get("chat_id") or ""),
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "text_preview": str(payload.get("text") or "")[:200],
+                    "failures": [{"item": "text", "error": "dead_letter", "code": None}],
+                    "dead_letter": True,
+                },
+                trace_id=event.trace_id,
+            )
+            self._redis.xadd(
+                ROUTER_STREAM,
+                event_to_redis(feedback),
+                maxlen=ROUTER_STREAM_MAXLEN,
+                approximate=True,
+            )
+        except Exception:  # noqa: BLE001 - 死信通知本身失败不能再抛
+            logger.error("outbox 死信回传 router 失败 entry=%s\n%s", entry_id, traceback.format_exc())
+        try:
+            self._reader.xack(OUTBOX_STREAM, OUTBOX_GROUP, entry_id)
+        except Exception:  # noqa: BLE001
+            logger.error("outbox 死信 ACK 失败 entry=%s\n%s", entry_id, traceback.format_exc())
+
     def run(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -214,15 +309,34 @@ class OutboxSender(threading.Thread):
                 continue
             if not result:
                 continue
-            for entry_id, fields in result[0][1]:
+            try:
+                entries = result[0][1]
+                iter(entries)
+            except (IndexError, KeyError, TypeError):
+                # Redis 返回结构异常时不能索引/迭代崩溃把线程带走
+                logger.error("outbox 返回结构异常：%r", result)
+                continue
+            for entry in entries:
+                if self._stop_event.is_set():
+                    break
+                # Redis 正常返回 (id, fields)；结构不对时只跳过这一条，不给线程殉葬的机会
+                try:
+                    entry_id, fields = entry
+                    if not isinstance(fields, dict):
+                        raise TypeError(f"fields 不是 dict: {type(fields).__name__}")
+                except (TypeError, ValueError):
+                    logger.error("outbox 条目结构异常，已跳过：%r", entry)
+                    continue
                 normalized = {
                     (k.decode() if isinstance(k, bytes) else str(k)): v for k, v in fields.items()
                 }
-                self._handle(entry_id, normalized)
+                self._dispatch(entry_id, normalized)
 
     def stop(self) -> None:
         self._stop_event.set()
-        self.join(timeout=2)
+        # 未 start 的线程 join 会抛 RuntimeError（看护线程重建路径会遇到）
+        if self.is_alive():
+            self.join(timeout=2)
 
 
 class RouterSupervisor(threading.Thread):
@@ -243,6 +357,7 @@ class RouterSupervisor(threading.Thread):
         self._stop_event = threading.Event()
         self._proc: Optional[subprocess.Popen] = None
         self._failures = 0
+        self._last_failure_at = 0.0
         self._next_attempt = 0.0
         self.spawn_count = 0
         self.last_exit_code: Optional[int] = None
@@ -284,6 +399,7 @@ class RouterSupervisor(threading.Thread):
                 logger.info("router 正常退出（空闲）")
             else:
                 self._failures += 1
+                self._last_failure_at = time.monotonic()
                 backoff = RETRY_BACKOFF_S[min(self._failures - 1, len(RETRY_BACKOFF_S) - 1)]
                 self._next_attempt = time.monotonic() + backoff
                 logger.error(
@@ -297,8 +413,14 @@ class RouterSupervisor(threading.Thread):
         if self._stop_event.is_set() or self._proc is not None:
             return
         if self._failures >= MAX_CONSECUTIVE_FAILURES:
-            # 连续失败多半是环境问题（凭证/DSN/模型），继续拉起只会刷日志。
-            return
+            # 连续失败多半是环境问题（凭证/DSN/模型），但等够久可以重置重试——
+            # MaaS 代理临时故障（multimodal download timeout）就属于这种场景。
+            if (time.monotonic() - self._last_failure_at) < FAILURE_RESET_S:
+                return
+            self._failures = 0
+            logger.info(
+                "连续失败已满 %ds 冷却期，重置计数重新尝试拉起 router", FAILURE_RESET_S
+            )
         if time.monotonic() < self._next_attempt:
             return
         if self.router_alive() or not self.has_work():
@@ -371,6 +493,33 @@ class LogRotator(threading.Thread):
         self.join(timeout=2)
 
 
+class SenderWatchdog(threading.Thread):
+    """看护 outbox 发送线程：意外退出就重建。
+
+    `OutboxSender.run()` 已经不因单条消息退出（`_dispatch` 收口），这里兜的是
+    其余可能：解释器级崩溃、`while` 里新增代码漏了 try、系统级异常。没有这一层时，
+    线程一死就再也没人发消息，而进程/长连接/心跳全部看起来正常。
+    """
+
+    def __init__(self, *, owner: Any, interval_s: float = SENDER_WATCH_INTERVAL_S) -> None:
+        super().__init__(name="sender-watchdog", daemon=True)
+        self._owner = owner
+        self._interval_s = interval_s
+        self._stop_event = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop_event.wait(self._interval_s):
+            try:
+                self._owner.ensure_sender_alive()
+            except Exception:
+                logger.error("看护 outbox 发送线程失败\n%s", traceback.format_exc())
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self.is_alive():
+            self.join(timeout=2)
+
+
 def _setup_logging() -> None:
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -395,11 +544,9 @@ class Gateway:
             decode_responses=True,
             socket_timeout=None,   # 阻塞读不能用 socket 超时
         )
-        self._sender = OutboxSender(
-            channel=self._channel,
-            command_client=self._redis,
-            read_client=self._outbox_reader,
-        )
+        self._sender = self._new_sender()
+        self._sender_watchdog = SenderWatchdog(owner=self)
+        self._stopping = False
         self._supervisor = RouterSupervisor(
             bus=self._bus,
             command_client=self._redis,
@@ -410,6 +557,28 @@ class Gateway:
         self._watchdog = TaskWatchdog(command_client=self._redis, store=self._store)
         self._scanner = ScheduleScanner(command_client=self._redis, store=self._store)
         self._log_rotator = LogRotator()
+
+    def _new_sender(self) -> OutboxSender:
+        """构造一个 outbox 发送线程（重建时复用同一套依赖）。"""
+        return OutboxSender(
+            channel=self._channel,
+            command_client=self._redis,
+            read_client=self._outbox_reader,
+        )
+
+    def ensure_sender_alive(self) -> None:
+        """由 `SenderWatchdog` 周期调用：发送线程意外退出时原地重建。"""
+        if self._stopping or self._sender.is_alive():
+            return
+        logger.critical(
+            "outbox 发送线程已退出，正在重建（该线程累计死信 %d）", self._sender.dead_letters
+        )
+        try:
+            self._sender.stop()
+        except Exception:  # noqa: BLE001 - 旧线程已死，stop 失败不影响重建
+            logger.error("停止旧 outbox 发送线程失败\n%s", traceback.format_exc())
+        self._sender = self._new_sender()
+        self._sender.start()
 
     # ------------------------------------------------------------------ 入队
     def enqueue(self, message: IncomingMessage) -> bool:
@@ -465,6 +634,7 @@ class Gateway:
     # ------------------------------------------------------------------ 运行
     def run_forever(self) -> None:
         self._sender.start()
+        self._sender_watchdog.start()
         self._supervisor.start()
         self._watchdog.start()
         self._scanner.start()
@@ -475,6 +645,8 @@ class Gateway:
         except KeyboardInterrupt:
             logger.info("收到中断，准备退出")
         finally:
+            self._stopping = True
+            self._sender_watchdog.stop()
             if settings.log_rotate_enabled:
                 self._log_rotator.stop()
             self._scanner.stop()
@@ -498,6 +670,7 @@ class Gateway:
             return 1
 
         self._sender.start()
+        self._sender_watchdog.start()
         self._supervisor.start()
         self._watchdog.start()
         deadline = time.monotonic() + wait_s
@@ -519,6 +692,8 @@ class Gateway:
             logger.error("等待 router 完成超时（%.0fs）", wait_s)
             return 5
         finally:
+            self._stopping = True
+            self._sender_watchdog.stop()
             self._watchdog.stop()
             self._supervisor.stop()
             self._sender.stop()

@@ -146,6 +146,10 @@ class Settings(BaseSettings):
     # ---------- Worker 三级上下文压缩（agents/compact.py，对齐 Claude Code 级联） ----------
     # 所有阈值按 context_window_tokens 的比例计算，随窗口缩放，不写死绝对值。
     # 有效上下文窗口（比例基准）：30w 有效窗口 × 20% = 6w 的 L2 单批摘要窗口。
+    # 注意：30w 不是模型真实窗口（deepseek-v4.1-flash 为 1M），而是**刻意压低**的
+    # worker 压缩预算——agent loop 每轮重发完整 messages，上下文越长，单轮与整任务的
+    # prompt 成本按轮数放大。30w × 0.85 = 255k 触发、× 0.60 = 180k 收口是成本闸门，
+    # 不是能力上限。调大只会让超长任务更贵，不会让它们更能干。
     context_window_tokens: int = 300_000
     # 触发水位：用量达到窗口 × 0.85 时开始压缩（L1 → L2 → L3 递进）
     compact_trigger_ratio: float = 0.85

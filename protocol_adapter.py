@@ -103,8 +103,14 @@ _ROLE_BY_TYPE = {
 
 # ----------------------------------------------------------------------------- 只读 SQLite
 def _ro_conn() -> sqlite3.Connection:
-    """只读短连接（WAL 下与 router 的写并发安全）。"""
-    conn = sqlite3.connect(f"file:{settings.db_path}?mode=ro", uri=True, timeout=5)
+    """只读短连接（WAL 下与 router 的写并发安全）。
+
+    Windows 下 `mode=ro` URI 参数在部分 Python 版本上会对 WAL/SHM 子文件
+    触发 CANTOPEN / IOERR（URI 只控主文件，子文件用默认模式打开）。
+    改用普通 connect + query_only pragma 更稳。
+    """
+    conn = sqlite3.connect(str(settings.db_path), timeout=5)
+    conn.execute("PRAGMA query_only = ON")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -875,10 +881,22 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（局域网访问用 0.0.0.0）")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
+
+    handlers: list = [logging.StreamHandler(sys.stdout)]
+
+    # 文件日志：尝试写 data_dir/logs/adapter-live.log；无权限则静默跳过（沙箱场景）。
+    try:
+        log_dir = settings.data_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "adapter-live.log"
+        handlers.append(logging.FileHandler(str(log_file), encoding="utf-8"))
+    except (PermissionError, OSError):
+        pass
+
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s [adapter] %(message)s",
-        stream=sys.stdout,
+        handlers=handlers,
     )
     uvicorn.run(create_app(), host=args.host, port=args.port, log_level="info")
     return 0

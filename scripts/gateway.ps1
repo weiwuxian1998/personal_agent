@@ -1,11 +1,11 @@
 #requires -Version 5.1
 <#
-Manual gateway lifecycle helper: start / stop / status / logs.
+Manual gateway lifecycle helper: start / stop / restart / status / logs.
 
 Detachment (why it survives closing this window):
   Our terminal runs inside a Windows job object; children started with
   Start-Process / & inherit that job and die when the window closes.
-  `start` therefore asks the WMI provider (WmiPrvSE.exe, a Windows service)
+  `start` asks the WMI provider (WmiPrvSE.exe, a Windows service)
   to create the process via Win32_Process.Create. The new process belongs to
   WmiPrvSE, not to our terminal/job, so closing the window does NOT kill it.
 
@@ -32,18 +32,40 @@ $ErrorActionPreference = 'Stop'
 
 $ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
-# 优先读 config.settings.worker_python（与 gateway 自身同一套配置）；
-# 未配置时回退到 PATH 里的 python.exe。这样换机器只改 .env，脚本本身不动。
+# Python resolution order:
+#   1. .env WORKER_PYTHON (absolute path, explicit config)
+#   2. Common conda env probe (find one that can import fastapi; feishu env preferred)
+#   3. PATH fallback (works only when PATH points to the right env)
+# This avoids the trap where `python -c ...` uses PATH's base env python and
+# settings.python_exe() also resolves to that same (wrong) python.
 function Resolve-PythonExe {
     param([string]$ProjectRoot)
+
+    # --- 1. .env WORKER_PYTHON ---
     try {
-        $out = python -c "import sys; sys.path.insert(0, r'$ProjectRoot'); from config import settings; print(settings.python_exe())" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $out) { return $out.Trim() }
+        $out = python -c "import sys; sys.path.insert(0, r'$ProjectRoot'); from config import settings; print(settings.worker_python or '')" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $out -and $out.Trim()) { return $out.Trim() }
     } catch {}
-    # 兜底：PATH 探测
+
+    # --- 2. Common conda env probe ---
+    $probeDirs = @(
+        "$env:USERPROFILE\miniconda3\envs\feishu\python.exe",
+        "$env:USERPROFILE\anaconda3\envs\feishu\python.exe",
+        "$env:USERPROFILE\miniconda3\envs\assistant\python.exe",
+        "$env:USERPROFILE\anaconda3\envs\assistant\python.exe"
+    )
+    foreach ($candidate in $probeDirs) {
+        $exists = Test-Path $candidate
+        if (-not $exists) { continue }
+        & $candidate -c "import fastapi" 2>$null
+        if ($LASTEXITCODE -eq 0) { return $candidate }
+    }
+
+    # --- 3. PATH fallback ---
     $candidate = (Get-Command python -ErrorAction SilentlyContinue).Source
     if ($candidate) { return $candidate }
-    throw "找不到 Python 解释器。请在 .env 里配 WORKER_PYTHON 或把 python 加进 PATH。"
+
+    throw "Python not found. Set WORKER_PYTHON in .env or add python to PATH."
 }
 
 $PythonExe  = Resolve-PythonExe -ProjectRoot $ProjectDir
@@ -174,12 +196,8 @@ function Start-Gateway {
 
     New-Item -ItemType Directory -Force -Path (Split-Path $LogFile) | Out-Null
 
-    # 启动前先按大小轮转一次（阈值/份数来自配置的 LOG_ROTATE_*，与常驻线程同一套逻辑）。
     Invoke-LogRotation
 
-    # Ask the WMI service to create the process: it is NOT our child, so closing
-    # this terminal (and its job object) will not kill it.
-    # The .cmd wrapper only redirects output; it keeps cmd /c quoting simple.
     $runner = Join-Path $ProjectDir 'scripts\gateway-run.cmd'
     $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
         CommandLine      = ('cmd.exe /c ""{0}" "{1}""' -f $runner, $PythonExe)

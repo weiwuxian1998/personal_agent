@@ -181,6 +181,27 @@ export interface ListResponse<T> { ok: boolean; items: T[] }
 export interface EventsResponse { ok: boolean; stream: string; items: { entry_id: string; event: EventEnvelope }[] }
 export interface LogResponse { ok: boolean; path?: string; size?: number; truncated?: boolean; text?: string; error?: string }
 
+// ---------------------------------------------------------------- 网页发送
+export interface SendMessageEcho {
+  ok: boolean;
+  message_id?: string;
+  error?: string;
+  code?: number;
+}
+
+export interface SendMessageResponse {
+  ok: boolean;
+  error?: string;
+  message?: string;
+  entry_id?: string;
+  event_id?: string;
+  web_message_id?: string;
+  chat_id?: string;
+  text?: string;
+  echo?: SendMessageEcho;
+  event?: EventEnvelope;
+}
+
 // ---------------------------------------------------------------- WS 帧
 export type ServerFrame =
   | { type: "hello"; status: StatusSnapshot; events: StreamEvent[] }

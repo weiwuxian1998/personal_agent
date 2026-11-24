@@ -605,6 +605,9 @@ class Gateway:
                     create_time_ms=message.create_time,
                     attachments=message.attachments,
                 ),
+                # 附件路径单独保留，网页端据此展示文件卡片/预览；text 里也有
+                # <attachment> 标签供模型引用。
+                "attachments": list(message.attachments or []),
                 "create_time": message.create_time,
             },
         )

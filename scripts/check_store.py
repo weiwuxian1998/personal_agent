@@ -310,6 +310,43 @@ def check_jsonl(tmp: Path) -> None:
     check("jsonl_read_since", [r["seq"] for r in read_records(directory, since_seq=2)] == [3])
     check("jsonl_read_limit", len(list(read_records(directory, limit=2))) == 2)
 
+    # ---- P2-1：崩溃留下的半行（无换行）不能被下一条 append 拼上去
+    torn_dir = tmp / "jsonl_torn"
+    torn_dir.mkdir(parents=True, exist_ok=True)
+    torn_writer = JsonlWriter(torn_dir, "turns")
+    torn_path = torn_writer.current_path()
+    torn_path.write_text(
+        json.dumps({"v": 1, "seq": 1, "ts": "x"}) + "\n" + '{"v":1,"seq":2,"ts":"x","pa',
+        encoding="utf-8",
+    )
+    torn_seq = torn_writer.append({"kind": "turn", "text": "灾后第一条"})
+    torn_lines = torn_path.read_text(encoding="utf-8").splitlines()
+    check("jsonl_torn_no_glue", len(torn_lines) == 3, str(len(torn_lines)))
+    check(
+        "jsonl_torn_last_readable",
+        json.loads(torn_lines[-1]).get("text") == "灾后第一条",
+        torn_lines[-1][:80],
+    )
+    check("jsonl_torn_seq", torn_seq == 2, str(torn_seq))
+
+    # ---- P2-1：read_records 遇坏行/非对象行/截断的 UTF-8 不中断
+    bad_dir = tmp / "jsonl_bad"
+    bad_dir.mkdir(parents=True, exist_ok=True)
+    (bad_dir / "turns-2026-01-05.jsonl").write_text(
+        json.dumps({"v": 1, "seq": 1, "ts": "x"}) + "\n"
+        + '{"v":1,"seq":2,"ts":"x","pa' + "\n"  # 坏 JSON
+        + "123\n"                                # 能解析但不是对象
+        + json.dumps({"v": 1, "seq": 3, "ts": "x"}) + "\n",
+        encoding="utf-8",
+    )
+    (bad_dir / "turns-2026-01-06.jsonl").write_bytes(
+        json.dumps({"v": 1, "seq": 4, "ts": "x"}).encode("utf-8")
+        + b"\n"
+        + b'{"v":1,"seq":5,"t":"ab\xe4\xb8'  # 截断在多字节字符中间
+    )
+    bad_seqs = [r["seq"] for r in read_records(bad_dir)]
+    check("jsonl_read_bad_line_skipped", bad_seqs == [1, 3, 4], str(bad_seqs))
+
     # ---- next_seq 的反向扫尾实现（docs/JSONL-WRITE-PERF-2026-11-22.md 方案 C）
     tail_dir = tmp / "jsonl_tail"
     tail_dir.mkdir(parents=True, exist_ok=True)

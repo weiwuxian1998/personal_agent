@@ -405,6 +405,22 @@ def _is_root_like(path: Path, *, home: Path) -> bool:
         return False
 
 
+def _is_fs_root(path: Path) -> bool:
+    """文件系统根 / 盘符根本身（**不含家目录**）。
+
+    与 `_is_root_like` 的差别：R2 把家目录也算"根"（递归删家目录必须拒），但 R8 不能
+    跳过家目录——R2 只认 `_R2_REMOVE` 那几个名字，`robocopy /MIR` 抹平家目录时没有任何
+    规则兜底（R2 审计 P0-3 洞 ①）。
+    """
+    text = str(path)
+    if text in {"/", "\\"}:
+        return True
+    try:
+        return path == Path(path.anchor)
+    except (OSError, ValueError):
+        return False
+
+
 def _is_under(child: Path, root: Path) -> bool:
     try:
         child.relative_to(root)
@@ -465,6 +481,9 @@ _R7_SEND = {
     "ssh",
     "send-mailmessage",
 }
+# 「会写盘」的命令名单。目标只是**覆盖自然写法**，不追求穷尽：
+# 解释器包裹（`powershell -Command` / `python -c`）、编码载荷、`& "x.exe"` 这类
+# 无限面不在这里处理——清单再长也堵不完，硬堵会误伤日常命令（见 R2 审计 P0-3）。
 _R8_WRITE = {
     "set-content",
     "out-file",
@@ -486,7 +505,44 @@ _R8_WRITE = {
     "rd",
     "rmdir",
     "ri",
+    # Windows 复制/移动/替换/解包：整理文件时最自然的一档
+    "copy",
+    "xcopy",
+    "robocopy",
+    "move",
+    "replace",
+    "expand",
+    # 打包/解包：解包能往任意目录写
+    "tar",
+    "7z",
+    "7za",
+    "zip",
+    "unzip",
+    "makecab",
+    "compress-archive",
+    "expand-archive",
+    # 下载落盘：`-o` / `-OutFile` / `--output` 的落点
+    "curl",
+    "wget",
+    "iwr",
+    "invoke-webrequest",
+    "invoke-restmethod",
+    "bitsadmin",
 }
+
+# 破坏性开关：镜像/清空目标、或搬走源文件，语义等价于递归删除。
+_R8_PURGE_FLAGS = {"/mir", "/purge", "/mov", "/move"}
+
+# 开关与值粘在一起（`-oC:\Windows`、`-OutFile:C:\x`、`-Path:D:\a`）：值要单独抽出来当
+# 目标。两种写法分开认——带分隔符的用完整开关名，粘连短开关只认"后面直接跟盘符路径"
+# 的形式，避免把 `-Force`、`-Filter` 之类误抽成目标。
+_INLINE_FLAG_SEP_RE = re.compile(
+    r"^[-/]{1,2}"
+    r"(literalpath|destinationpath|destination|outfile|outputfile|output|target|path|dest|file|out|o)"
+    r"[:=](\S.*)$",
+    re.IGNORECASE,
+)
+_INLINE_FLAG_GLUED_RE = re.compile(r"^[-/]{1,2}([A-Za-z])([A-Za-z]:[\\/].*)$")
 
 _R7_PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE)
 _R7_AUTH_HEADER = re.compile(r"\bauthorization\s*:", re.IGNORECASE)
@@ -501,6 +557,21 @@ def _is_flag(token: str, command: str) -> bool:
         return False
     # cmdlet / cmd 风格：`/s`、`/q` 是开关；`/` 与 `C:\` 是路径
     return len(token) > 1 and token.startswith("/") and not re.match(r"^/[^\\/]+[\\/]", token)
+
+
+def _inline_flag_value(token: str) -> str | None:
+    """从粘连写法里抽出目标路径：`-oC:\\Windows`、`-OutFile:C:\\x`、`-Path:D:\\a`。
+
+    返回 None 表示"不是粘连的路径值"（普通开关、或值不像路径）。这些 token 原本会
+    被 `_is_flag` 整条当成开关丢掉，导致写目标完全不被检查（R2 审计 P0-5 同源）。
+    """
+    match = _INLINE_FLAG_SEP_RE.match(token) or _INLINE_FLAG_GLUED_RE.match(token)
+    if not match:
+        return None
+    value = match.group(2)
+    if re.match(r"^[A-Za-z]:[\\/]", value) or "\\" in value or "/" in value:
+        return value
+    return None
 
 
 def _recursive(flags: list[str], command: str) -> bool:
@@ -719,16 +790,27 @@ def _hit_r8(
     if command not in _R8_WRITE and not extra_targets:
         return None
     roots = write_roots or [workspace_root]
-    targets = [a for a in args if not _is_flag(a, command) and _looks_like_path(a)]
-    targets.extend(extra_targets)
+    # 镜像/清空开关会把目标目录里的多余文件全部删掉，语义上是递归删除。
+    purge = next((a for a in args if a.lower() in _R8_PURGE_FLAGS), None)
+    raw_targets: list[str] = []
+    for arg in args:
+        inline = _inline_flag_value(arg)
+        if inline is not None:
+            raw_targets.append(inline)  # `-oC:\Windows`：值本身就是目标
+            continue
+        if _is_flag(arg, command):
+            continue
+        if _looks_like_path(arg):
+            raw_targets.append(arg)
+    raw_targets.extend(extra_targets)
     resolved: list[tuple[str, Path]] = []
-    for raw in targets:
+    for raw in raw_targets:
         path = _resolve(raw, home=home, base=base)
-        if path is None or _is_root_like(path, home=home):
-            continue  # 根目录交给 R2/R1，不重复判
+        if path is None or _is_fs_root(path):
+            continue  # 盘符根交给 R1/R2，不重复判；家目录不在此列（见 _is_fs_root）
         resolved.append((raw, path))
-    # 禁区优先：目标里只要有一个落在系统目录或需保护的源码，直接拒绝（deny 高于 need_confirm）。
-    # 必须先判禁区再判 write_roots——仓库就在 workspace_root 之内，顺序反了会被 `continue` 放行。
+    # 1) 禁区优先：目标里只要有一个落在系统目录或需保护的源码，直接拒绝（deny 高于 need_confirm）。
+    #    必须先判禁区再判 write_roots——仓库就在 workspace_root 之内，顺序反了会被 `continue` 放行。
     for _raw, path in resolved:
         if is_forbidden(path):
             return RuleHit(
@@ -737,6 +819,16 @@ def _hit_r8(
                 "该命令会写入禁区（系统目录或助手源码），已被策略拒绝。",
                 "系统目录与助手源码只允许读；要改代码请在工作区另建副本。",
             )
+    # 2) 镜像/清空：目标落在盘符根、家目录或个人目录，等价于递归删除，拒绝。
+    if purge is not None:
+        for _raw, path in resolved:
+            if _is_root_like(path, home=home) or _is_protected(path, home):
+                return RuleHit(
+                    "R8",
+                    "deny",
+                    f"该命令带镜像/清空开关（{purge}），会删除目标目录内的全部内容，已被策略拒绝。",
+                    "如需同步目录，请指明一个具体子目录；个人目录与家目录请手动处理。",
+                )
     for _raw, path in resolved:
         if any(_is_under(path, root) for root in roots):
             continue

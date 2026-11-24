@@ -9,12 +9,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
 from contracts import TZ_SHANGHAI, now_iso
+
+logger = logging.getLogger(__name__)
 
 
 # 反向扫尾的窗口大小：先读最后 8 KB（通常一两行就够），不够再翻倍扩窗。
@@ -149,6 +152,12 @@ class JsonlWriter:
 
         注意：只追加，不修改已有文件内容；`flush + fsync` 保证进程崩溃后
         已返回的记录仍在磁盘上。
+
+        写之前先看文件尾最后一个字节：**上一个进程可能在写半行时被杀**，此时
+        文件尾没有 `\\n`。直接 `write(line + "\\n")` 会把新记录拼到那半行后面，
+        变成 `{...,"seq":43,"pa{"v":1,...}` 这样一条永久不可解析的长行，
+        崩一次就毁掉两条记录。所以尾字节不是换行时先补一个 `\\n`，
+        让那半行独立成行（它本身已经坏掉，至少不连累新记录）。
         """
         data = dict(record)
         data.setdefault("v", 1)
@@ -160,8 +169,15 @@ class JsonlWriter:
 
         path = self.current_path()
         line = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        with open(path, "a+b") as fh:  # 追加 + 可读，用来探测尾字节
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            needs_break = False
+            if size > 0:
+                fh.seek(-1, os.SEEK_END)
+                needs_break = fh.read(1) != b"\n"
+            payload = ("\n" if needs_break else "") + line + "\n"
+            fh.write(payload.encode("utf-8"))
             fh.flush()
             os.fsync(fh.fileno())
         return seq
@@ -181,6 +197,11 @@ def read_records(
     """按文件日期、文件内顺序读取记录，只返回 `seq > since_seq` 的行。
 
     只读，不会创建文件；目录不存在时返回空迭代。
+
+    **坏行不中断读取**：崩溃可能留下半行（无换行、JSON 截断）或非对象的行，
+    以前这里裸调 `json.loads`，一行坏数据就让整个生成器抛异常，`/api/turns`、
+    `/api/inbox` 从此 500。现在逐行 try：解析失败的跳过并计数，读完一个文件
+    打一条 WARNING；打开失败的文件整个跳过。宁可少读一条，不能整条链路挂掉。
     """
     directory = Path(directory)
     if not directory.exists():
@@ -188,12 +209,27 @@ def read_records(
     files = sorted(directory.glob("*.jsonl"))
     emitted = 0
     for path in files:
-        with open(path, "r", encoding="utf-8") as fh:
+        bad = 0
+        try:
+            # errors="replace"：文件尾若有被截断的多字节字符，strict 会抛
+            # UnicodeDecodeError（同样是"一行坏数据杀死整个读取"）。
+            fh = open(path, "r", encoding="utf-8", errors="replace")
+        except OSError:
+            logger.warning("jsonl 无法打开，已跳过：%s", path)
+            continue
+        with fh:
             for line in fh:
                 line = line.strip()
                 if not line:
                     continue
-                record = json.loads(line)
+                try:
+                    record = json.loads(line)
+                except (ValueError, RecursionError):
+                    bad += 1  # JSONDecodeError ⊂ ValueError
+                    continue
+                if not isinstance(record, dict):
+                    bad += 1
+                    continue
                 seq = record.get("seq")
                 if isinstance(seq, int) and seq <= since_seq:
                     continue
@@ -201,3 +237,5 @@ def read_records(
                 emitted += 1
                 if limit is not None and emitted >= limit:
                     return
+        if bad:
+            logger.warning("%s 有 %d 行无法解析（崩溃残留），已跳过", path.name, bad)

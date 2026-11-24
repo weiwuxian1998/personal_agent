@@ -39,8 +39,9 @@ def _prefix_files(directory: Path, prefix: str) -> list[Path]:
 def iter_records(directory: Path, *, prefix: str = "turns") -> Iterator[dict]:
     """按文件日期、文件内顺序读取某个前缀的全部记录；坏行跳过。
 
-    `memory/jsonl.read_records` 读目录下**所有** `*.jsonl` 且不吞坏行，这里
-    按前缀过滤并容忍崩溃留下的半行，供记账与回读共用。
+    与 `memory/jsonl.read_records` 的差别只在**范围**：那个读目录下所有
+    `*.jsonl`，这里按前缀过滤。两者都容忍崩溃留下的半行（P2-1 修之前
+    `read_records` 是不吞的，一行坏数据会让 `/api/turns` 直接 500）。
     """
     for path in _prefix_files(directory, prefix):
         with open(path, "r", encoding="utf-8") as fh:

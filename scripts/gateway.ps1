@@ -31,7 +31,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$PythonExe  = 'C:\Users\wangzs\anaconda3\envs\assistant\python.exe'
+$PythonExe  = 'C:\Users\34897\miniconda3\envs\feishu\python.exe'
 $LogFile    = Join-Path $ProjectDir 'logs\gateway-live.log'
 $PidFile    = Join-Path $ProjectDir 'logs\gateway.pid'
 

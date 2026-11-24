@@ -26,6 +26,7 @@ pydantic-settings==2.12.0
 # OpenAI 兼容 LLM（DeepSeek）
 langchain-openai==1.7.4
 httpx==0.28.1
+requests==2.32.3
 
 # CUA 截图/图像处理（cua/screen.py 依赖 PIL）
 pillow==13.0.0

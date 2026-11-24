@@ -3,8 +3,9 @@
 §8.2 明确不提供 `open_app`：启动程序走开始菜单的视觉操作。但"用哪个 Chromium"
 是环境准备，属于运行时职责，只能有一处配置——`Settings.cua_browser_exe`：
 
-- 默认：`D:\\repo\\chrome-win64\\chrome.exe`（145）
-- 备选：`...\\cua-browsers\\chromium-1254\\chrome-win64\\chrome.exe`（158）
+- 留空（默认）：自动探测 PATH / Program Files / LocalAppData 里的 chrome / edge
+- 显式指定：`.env` 里配 `CUA_BROWSER_EXE=D:\\repo\\chrome-win64\\chrome.exe`
+  （适合多内核共存、或 PATH 不包含目标 exe 的机器）
 
 切换内核只改这一项配置，不改代码。用独立 user-data-dir，避免和用户日常 Chrome
 抢单实例锁，也让首次启动行为可复现。
@@ -23,7 +24,26 @@ logger = logging.getLogger("cua.browser")
 
 
 def browser_exe(settings: Settings) -> Path:
-    return Path(settings.cua_browser_exe).expanduser()
+    exe = (settings.cua_browser_exe or "").strip()
+    if exe:
+        return Path(exe).expanduser()
+    # 自动探测：PATH 优先，其次常见安装位置
+    import shutil
+    found = shutil.which("chrome.exe") or shutil.which("chromium.exe")
+    if found:
+        return Path(found)
+    for root in (
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+    ):
+        candidate = Path(root)
+        if candidate.exists():
+            return candidate
+    # 全部探测失败：返回一个不可能存在的路径，ensure_browser 会给出明确错误
+    return Path("cua_browser_not_configured")
 
 
 def _running_pid(exe: Path) -> int | None:

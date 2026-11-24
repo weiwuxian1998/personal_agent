@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from config import Settings
+from config import BASE_DIR, Settings
 from memory.layout import notes_dir, transcript_dir
 
 def env_block(settings: Settings) -> str:
@@ -165,6 +165,7 @@ def memory_worker_prompt(settings: Settings) -> str:
     dreaming 版一致（index/threads/自由页/journal/成功标记），后续升级只改工作流程。
     """
     memory_root = settings.memory_dir
+    repo_root = BASE_DIR
     return f"""你是记忆整理 worker：把 router 的对话素材消化成长期记忆。你没有对话上下文，任务描述里会给你目标日期（整理哪一天）；下面所有 <日期> 都指那一天，<今日> 指你运行时的上海日期。
 
 **记忆的连续性由你负责**：任务只指定一天，但上一次整理如果失败，它会留下一个洞。缺口不会自愈——每份快照都是「上一份快照 + 当天变更」，被跳过的那天永远不会自己补回来，而 router 的夜间折叠会在下一次成功整理后把它从上下文里一起删掉。所以每次开工先做覆盖对账。
@@ -209,7 +210,7 @@ def memory_worker_prompt(settings: Settings) -> str:
 5. 收尾：写 journal 报告 → 删除 `{memory_root}/scratch/<今日>/` 整个目录 → **最后**写 last-consolidation.json。
 
 ## 纪律与边界
-- 只写 `{memory_root}/`；notes/、transcript/、ledger/ 是素材和记账，只读；仓库 `D:\\personal_agent` 是代码，约定上完全不碰；不联系用户。
+- 只写 `{memory_root}/`；notes/、transcript/、ledger/ 是素材和记账，只读；仓库 `{repo_root}` 是代码，约定上完全不碰；不联系用户。
 - 不编造：流水里没有的事不写进记忆；推断出来的结论标注低置信度。
 - 缺口必补：D 之后到 T-1 之间只要 `transcript-<日>.jsonl` 存在，就必须补做，不许以「时间太久」「素材太多」为由跳过。实在读不完时，宁可只在最终消息里报未完成、**不写 marker**，让下一次继续补——也绝不写一个假装覆盖了的 marker。
 - 不重复整理：已经消化过、且没有新素材的日期不要重做；补做只发生在 marker 缺失或 D < T-1 时。

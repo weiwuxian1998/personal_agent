@@ -804,7 +804,6 @@ def create_app() -> FastAPI:
             return JSONResponse({"ok": False, "error": "not_found", "path": str(raw)}, status_code=404)
         roots = [
             Path(settings.workspace_root).resolve(),
-            Path(settings.play_root_path).resolve(),
             Path(settings.inbox_dir).resolve(),
             Path(settings.tool_outputs_dir).resolve(),
             Path(settings.workers_dir).resolve(),

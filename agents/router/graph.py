@@ -35,22 +35,22 @@ def build_router(
 ):
     tools = [build_reply_user_tool(bus=outbox, redis_client=redis_client)]
     tools.extend(build_session_tools(session_service))
-    # 区域模型：可玩耍区（play_root）读写删全开；Desktop/Downloads/Documents 与附件目录只读。
-    play_root = settings.play_root_path
+    # 区域模型：workspace_root（可玩耍区）读写删全开；Desktop/Downloads/Documents 与附件目录只读。
+    workspace = settings.workspace_root
     tools.extend(
         build_fs_tools(
-            workspace_root=play_root,
+            workspace_root=workspace,
             tool_outputs_dir=settings.tool_outputs_dir,
             read_roots=[*settings.readonly_root_paths, settings.inbox_dir],
-            write_roots=[play_root],
+            write_roots=[workspace],
         )
     )
     tools.extend(
         build_shell_tools(
             profile="router",
-            workspace_root=play_root,
+            workspace_root=workspace,
             tool_outputs_dir=settings.tool_outputs_dir,
-            default_cwd=play_root,
+            default_cwd=workspace,
         )
     )
     # 上下文管理全被动（压缩/折叠由中间件自动处理），不再暴露主动 new_context 工具。

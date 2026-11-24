@@ -201,17 +201,16 @@ class Settings(BaseSettings):
     log_rotate_check_s: int = 60
 
     # ---------- 文件区域（§7.1 / B3）----------
-    # 可玩耍区：读写删全放开的唯一区域。留空 = workspace_root；
+    # workspace_root = 可玩耍区：读写删全放开的唯一区域；Shell 默认 cwd 也指向这里。
     # 把助手整体搬到 D 盘时配成 `D:\agent`（或 `D:\`），所有工具与 Shell cwd 同步生效。
-    play_root: str = ""
     # 只读区：默认用户主目录下的 Desktop / Downloads / Documents；可增删（相对名或绝对路径）。
     # 写/删一律拒绝，只有 Read/Glob/Grep 能进去。
     readonly_roots: list[str] = []
 
     # ---------- CUA（§8，纯视觉单屏） ----------
-    # 浏览器内核**唯一**配置点：默认 145；切 158 只改这一行。
-    # 备选：C:\Users\34897\Documents\Trae-CN\temp_20261108_06\cua-browsers\chromium-1254\chrome-win64\chrome.exe
-    cua_browser_exe: str = r"D:\repo\chrome-win64\chrome.exe"
+    # 浏览器内核**唯一**配置点。留空 = 自动探测 PATH / 常见安装位置；
+    # 多内核共存或换机器时配成绝对路径（如 D:\repo\chrome-win64\chrome.exe）。
+    cua_browser_exe: str = ""
     # 任务开始前是否自动拉起内核；桌面类任务不需要，默认关。
     cua_browser_autostart: bool = False
     # 截图保留窗口（张）：1 = 只有当前一张；越大前后对比视野越长。
@@ -224,12 +223,6 @@ class Settings(BaseSettings):
     cua_wait_max_ms: int = 5000
 
     # ---------- 派生路径 ----------
-    @property
-    def play_root_path(self) -> Path:
-        """可玩耍区（真实绝对路径）。"""
-        raw = (self.play_root or "").strip()
-        return Path(raw).expanduser().resolve() if raw else self.workspace_root
-
     @property
     def readonly_root_paths(self) -> list[Path]:
         """只读区列表（真实绝对路径）；飞书附件目录由调用方另外追加。"""

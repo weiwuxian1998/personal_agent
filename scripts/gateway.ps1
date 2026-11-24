@@ -31,7 +31,22 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$PythonExe  = 'C:\Users\34897\miniconda3\envs\feishu\python.exe'
+
+# 优先读 config.settings.worker_python（与 gateway 自身同一套配置）；
+# 未配置时回退到 PATH 里的 python.exe。这样换机器只改 .env，脚本本身不动。
+function Resolve-PythonExe {
+    param([string]$ProjectRoot)
+    try {
+        $out = python -c "import sys; sys.path.insert(0, r'$ProjectRoot'); from config import settings; print(settings.python_exe())" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $out) { return $out.Trim() }
+    } catch {}
+    # 兜底：PATH 探测
+    $candidate = (Get-Command python -ErrorAction SilentlyContinue).Source
+    if ($candidate) { return $candidate }
+    throw "找不到 Python 解释器。请在 .env 里配 WORKER_PYTHON 或把 python 加进 PATH。"
+}
+
+$PythonExe  = Resolve-PythonExe -ProjectRoot $ProjectDir
 $LogFile    = Join-Path $ProjectDir 'logs\gateway-live.log'
 $PidFile    = Join-Path $ProjectDir 'logs\gateway.pid'
 

@@ -24,12 +24,12 @@ Action = Literal["deny", "need_confirm"]
 
 # ---------------------------------------------------------------------------- 区域常量
 # 禁区是**唯一允许硬编码的底线**：这些目录永远不可写、不可删，
-# 即使被 `play_root` 配置成可玩耍区也一律拒绝。不要把它做成配置项。
+# 即使 workspace_root 里也一律拒绝。不要把它做成配置项。
 # 盘符根只禁"根本身"（否则整块 C: 都不可用，配置 `D:\` 也会被误伤）。
 #
 # 另有一层"源码保护"（`is_source_path`）：助手自身仓库里的**代码与配置**不可写、
 # 不可删；但仓库里的其他数据（logs/、临时文件、dist/、.workbuddy/ 等）不设硬限，
-# 与 play_root 里别的位置一样对待。红线是"别改源码"，不是"仓库不许碰"。
+# 与 workspace_root 里别的位置一样对待。红线是"别改源码"，不是"仓库不许碰"。
 FORBIDDEN_EXACT: tuple[str, ...] = ("C:\\", "/")
 FORBIDDEN_SUBTREES: tuple[str, ...] = (
     "C:\\Windows",
@@ -728,7 +728,7 @@ def _hit_r8(
             continue  # 根目录交给 R2/R1，不重复判
         resolved.append((raw, path))
     # 禁区优先：目标里只要有一个落在系统目录或需保护的源码，直接拒绝（deny 高于 need_confirm）。
-    # 必须先判禁区再判 write_roots——仓库就在 play_root 之内，顺序反了会被 `continue` 放行。
+    # 必须先判禁区再判 write_roots——仓库就在 workspace_root 之内，顺序反了会被 `continue` 放行。
     for _raw, path in resolved:
         if is_forbidden(path):
             return RuleHit(

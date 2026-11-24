@@ -67,9 +67,9 @@ def _worker_tools(
     write_roots: list[Path],
 ) -> list[Any]:
     """general / memory_consolidate 共用的工具装配：fs + shell + web。"""
-    play_root = settings.play_root_path
+    workspace = settings.workspace_root
     tools = build_fs_tools(
-        workspace_root=play_root,
+        workspace_root=workspace,
         tool_outputs_dir=settings.tool_outputs_dir,
         read_roots=read_roots,
         write_roots=write_roots,
@@ -77,7 +77,7 @@ def _worker_tools(
     tools.extend(
         build_shell_tools(
             profile="worker",
-            workspace_root=play_root,
+            workspace_root=workspace,
             tool_outputs_dir=settings.tool_outputs_dir,
             default_cwd=task.cwd,
         )
@@ -97,12 +97,12 @@ def _worker_tools(
 
 
 def _general_tools(*, settings: Settings, task: TaskSpec, redis_client: Any = None) -> list[Any]:
-    # 区域模型：可玩耍区（play_root）读写删全开；Desktop/Downloads/Documents 与附件目录只读。
+    # 区域模型：workspace_root（可玩耍区）读写删全开；Desktop/Downloads/Documents 与附件目录只读。
     return _worker_tools(
         settings=settings,
         task=task,
         read_roots=[*settings.readonly_root_paths, settings.inbox_dir],
-        write_roots=[settings.play_root_path],
+        write_roots=[settings.workspace_root],
     )
 
 
@@ -140,7 +140,7 @@ _REGISTRY: dict[str, TaskKindSpec] = {
         kind="general",
         system_prompt=worker_prompt,
         build_tools=_general_tools,
-        default_cwd=lambda s: s.play_root_path,
+        default_cwd=lambda s: s.workspace_root,
     ),
     "memory_consolidate": TaskKindSpec(
         kind="memory_consolidate",

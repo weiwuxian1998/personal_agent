@@ -1,7 +1,7 @@
 """protocol_adapter 验收脚本（退出码 0 才算交付）。
 
-完全只读验收：所有 REST/WS 断言都打在真实 Redis/SQLite/Postgres 上，但不写任何
-业务数据；并断言写入口（POST /api/messages、WS send 帧）已不存在/被忽略。
+默认只读验收：所有 REST/WS 断言都打在真实 Redis/SQLite/Postgres 上，但不写任何
+业务数据；网页发送只验证空消息被 400 拒绝，不产生真实飞书消息；WS send 帧仍被忽略。
 
 运行：python scripts/check_adapter.py
 """
@@ -94,9 +94,9 @@ def test_readonly_api() -> None:
         r = client.get("/api/watches")
         check("watches_ok", r.json().get("ok") is True)
 
-        # 写入口必须已拆除：POST /api/messages 不存在（404/405）
-        r = client.post("/api/messages", json={"text": "只读验收，不应入队"})
-        check("messages_route_removed", r.status_code in (404, 405), f"got {r.status_code}")
+        # 网页发送端点存在；空消息必须在入队前被 400 拒绝，不能产生真实飞书消息
+        r = client.post("/api/messages", json={"text": ""})
+        check("messages_route_validates_empty", r.status_code == 400, f"got {r.status_code}")
 
         with client.websocket_connect("/ws") as ws:
             hello = ws.receive_json()

@@ -1,6 +1,6 @@
 # personal-assistant
 
-飞书个人助理：常驻 gateway 接收飞书消息，按需拉起 router（LangGraph + Postgres checkpoint）决策，长任务交给 worker 子进程执行；Redis Streams 做事件总线。内置**分层记忆**（index / threads / journal）、**Windows 桌面与浏览器自动化（CUA）**、WebSearch/WebFetch 网络工具，并附带一个**只读 Web 控制台**，在浏览器里观察会话、任务、定时、成本与网关状态。
+飞书个人助理：常驻 gateway 接收飞书消息，按需拉起 router（LangGraph + Postgres checkpoint）决策，长任务交给 worker 子进程执行；Redis Streams 做事件总线。内置**分层记忆**（index / threads / journal）、**Windows 桌面与浏览器自动化（CUA）**、WebSearch/WebFetch 网络工具，并附带一个 **Web 控制台**：在浏览器里观察会话、任务、定时与网关状态，也可以直接发送消息（网页消息会镜像到飞书，手机端同步可见）。
 
 本文档面向**部署者（人或自动化智能体）**，以 Windows 原生部署为主线，不依赖 Docker / WSL。每一步都给出命令与预期结果，按顺序执行即可。
 
@@ -22,8 +22,9 @@
   Shell/fs/Web    Windows 桌面   index.md + threads/
   Schedule/CUA    与浏览器操控   journal + 素材/记账区
 
-protocol_adapter.py（只读控制台后端，FastAPI + WebSocket，默认 127.0.0.1:8765）
-   └── 托管 ui/web/dist 前端；只读 Redis / SQLite / Postgres，无任何写命令
+protocol_adapter.py（Web 控制台后端，FastAPI + WebSocket，默认 127.0.0.1:8765）
+   └── 托管 ui/web/dist 前端；默认只读 Redis / SQLite / Postgres；
+       POST /api/messages 是唯一写入口：入队 router stream + 调飞书 API 镜像到手机
 ```
 
 ---
@@ -98,7 +99,7 @@ copy .env.example .env
 
 编辑 `.env`，最小可用配置：
 
-| 变量 | 只读控制台 | 完整机器人 | 示例 / 说明 |
+| 变量 | 只读观测 | 完整机器人 / 网页发送 | 示例 / 说明 |
 |---|---|---|---|
 | `REDIS_URL` | 必填 | 必填 | `redis://127.0.0.1:6379/0` |
 | `POSTGRES_DSN` | 必填 | 必填 | `postgresql://postgres:你的密码@127.0.0.1:5432/assistant` |
@@ -128,7 +129,7 @@ npm --prefix ui/web run build
 
 **预期**：`ui/web/dist/index.html` 生成，`tsc --noEmit` 无类型错误。
 
-### 2.6 启动只读控制台
+### 2.6 启动 Web 控制台
 
 ```powershell
 python protocol_adapter.py
@@ -139,10 +140,10 @@ python protocol_adapter.py
 **预期**：
 
 - `GET /api/status` 返回 JSON，`redis_ok: true`、`postgres_ok: true`；`gateway.alive: false` 属正常（还没启动机器人）。
-- `GET /` 返回控制台页面（总览 / Router 上下文 / Workers / 定时 / 成本五个页签）。若 dist 未构建，返回 JSON 占位说明。
+- `GET /` 返回控制台页面（总览 / Router 上下文 / Workers / 定时四个页签）。若 dist 未构建，返回 JSON 占位说明。
 - 全新部署没有历史数据时各页显示空态，属正常。
 
-控制台是**纯只读**：不发送消息、不写 Redis、SQLite 以 `mode=ro` 打开；且**无鉴权**，请保持绑定 127.0.0.1，不要暴露公网。
+控制台默认只读：SQLite 以 `mode=ro` 打开，Redis 除 `POST /api/messages` 外不写。总览页的对话框支持网页发送：消息会进入 router，并调用飞书 API 发一条 `【网页】` 镜像到当前会话，手机端也能看到；助理回复继续由 gateway 推送。助理回复里提到的本地文件、`products` 和飞书附件会显示为文件卡片，点击可预览图片/PDF/音视频/文本；Markdown 会渲染成排版后的正文，HTML 会在 sandbox iframe 中渲染（两者都先经 DOMPurify 清洗）。`GET /api/files` 只允许 workspace、inbox、tool_outputs、workers 内的文件。该接口**无鉴权**，请保持绑定 127.0.0.1，不要暴露公网。
 
 ### 2.7 （可选）完整飞书机器人
 
@@ -166,10 +167,11 @@ python protocol_adapter.py
 | 4 | 配置可读 | `python -c "import config; s=config.settings; print(s.redis_url, bool(s.postgres_dsn))"` | 打印 URL 与 `True`，无异常 |
 | 5 | 前端产物 | 检查 `ui/web/dist/index.html` | 存在（或已按 2.5 构建） |
 | 6 | 控制台存活 | `curl http://127.0.0.1:8765/api/status` | HTTP 200，`redis_ok`/`postgres_ok` 均 true |
-| 7 | 只读约束 | `curl -X POST http://127.0.0.1:8765/api/messages` | HTTP 404/405（写路径已移除） |
-| 8 | 页面 | 浏览器打开 `http://127.0.0.1:8765` | 渲染控制台，无 JS 报错 |
+| 7 | 发送入口存在 | `python -c "import requests; print(requests.post('http://127.0.0.1:8765/api/messages', json={'text': ''}).status_code)"` | 输出 `400`（空消息被拒，说明端点已启用） |
+| 8 | 页面 | 浏览器打开 `http://127.0.0.1:8765` | 渲染控制台，对话框可输入并发送 |
 | 9 | （完整部署）gateway | `scripts\status-gateway.cmd` | 进程存在、日志有 `connected to wss` |
 | 10 | （完整部署）端到端 | 飞书给机器人发一条消息 | 收到回复；`/api/status` 中 outbox 无持续积压 |
+| 11 | 文件预览 | 控制台对话里点击文件卡片 | 文本/图片/PDF 能在弹层预览，越界路径返回 403 |
 
 注意：`scripts/check_adapter.py` 是**开发验收脚本**，断言里要求已有历史会话数据（`sessions.total > 0`），**不适合空库的全新部署**；全新部署用上表 1–8 验收。
 
@@ -179,7 +181,7 @@ python protocol_adapter.py
 main_gateway.py        常驻进程：飞书长连接 + outbox 发送（含引用回复）+ router 拉起 + 定时/看门狗
 main_router.py         按需决策进程（由 gateway 拉起，勿手动常驻）；业务装配在 agents/router/
 worker_runner.py       长任务子进程（由 router 派生，读 task.json，结果写回 worker_result）
-protocol_adapter.py    只读 Web 控制台后端（FastAPI + WS，自带 __main__）
+protocol_adapter.py    Web 控制台后端（观测 + 网页发送，FastAPI + WS，自带 __main__）
 config.py              全部配置项（只读 .env / 环境变量）★冻结
 contracts.py           事件/数据契约 ★冻结
 log_rotation.py        日志轮转
@@ -217,7 +219,7 @@ docs/                  工程契约 / 运维手册 / 记忆设计 / CUA 调研 /
 
 ## 6. 安全与开发约束
 
-- 控制台**只读、无鉴权**：保持 127.0.0.1 绑定；需要远程访问自行加反向代理与鉴权。
+- 控制台**默认只读、无鉴权**：`POST /api/messages` 可写并会向飞书发消息；保持 127.0.0.1 绑定，需要远程访问自行加反向代理与鉴权。
 - 密钥只进 `.env`（或 `ASSISTANT_ENV_FILE` 指向的仓库外文件）；日志对 key 脱敏（只显示 `sk-xxxx…末4位`）。不要提交 `.env`、`*.pem`、`*.key` 及任何密钥备份文件。
 - `LLM_API_KEY` 与 `DEEPSEEK_SEARCH_API_KEY` 物理隔离：后者仅供 `/v1/tools/search` 与 `/v1/tools/fetch`，两边代码都不允许 fallback 到对方。
 - 标 ★ 的文件为**冻结契约文件**（`contracts.py`、`config.py`、`bus/envelope.py`、`channel/base.py`、`agents/context.py`、`agents/vision.py`、`requirements.txt`、`.env.example`、`.gitignore`、`docs/ENGINEERING_CONTRACT.md`）：修改须走 `docs/ENGINEERING_CONTRACT.md` §11 变更流程，部署时**不要改**。

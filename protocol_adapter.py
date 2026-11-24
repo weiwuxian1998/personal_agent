@@ -1,18 +1,22 @@
-"""Web UI 协议适配器（阶段 1）：只读观测控制台。
+"""Web UI 协议适配器：只读观测 + 网页发送入口。
 
-定位：gateway 旁边的**独立进程**，不改动 gateway/router/worker 的任何行为。
+定位：gateway 旁边的**独立进程**；除 `POST /api/messages` 外，不改变
+gateway/router/worker 的行为。
 
 设计约束（工程契约）：
 - SQLite **只读**（`mode=ro` URI 短连接）：业务表只许 router 写（§5.2）；
-- Redis **完全只读**：没有任何写命令（不 XADD / SET / DEL）；实时事件用 `XREAD` tail
-  router/outbox 两条 stream——不建消费组、不进 PEL，对现有消费零影响；
+- Redis 默认只读；唯一写入口是 `POST /api/messages`，它向 router stream
+  XADD 一条 `user_message`，并直接调用飞书 OpenAPI 发一条 `【网页】` 镜像，
+  让手机端也能看到网页里发出的内容。不建消费组、不进 PEL；
 - **不创建任何新的 Redis 状态键**（§6.5）；
 - checkpoint 只读（`saver.get_tuple`，与 tools/sessions.py 的 read_session 同款），
   不写、不续跑；
-- 控制台只观察、不发消息：对话发生在飞书，UI 通过 tail outbox 镜像显示。
+- 网页消息的 router 回复仍走既有 outbox → gateway → 飞书链路。
 
 REST（全部 /api 前缀）：
   GET  /api/status                 机器人/网关/router/stream 状态快照
+  POST /api/messages               网页发送：入队 router + 飞书镜像（写入口）
+  GET  /api/files?path=&download=  只读文件预览/下载（workspace/inbox/tool_outputs/workers）
   GET  /api/sessions               worker 会话列表（SQLite + task.json + pid 存活）
   GET  /api/sessions/{id}          会话详情 + checkpoint 消息（分页，从尾部往前）
   GET  /api/sessions/{id}/log      worker 日志尾部
@@ -53,8 +57,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 import redis
+import requests
 import uvicorn
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -65,10 +70,14 @@ from bus.envelope import (
     ROUTER_HEARTBEAT_KEY,
     ROUTER_STATE_KEY,
     ROUTER_STREAM,
+    ROUTER_STREAM_MAXLEN,
     event_from_redis,
+    event_to_redis,
+    new_event,
 )
+from channel.base import wrap_user_query
 from config import settings
-from contracts import now_iso
+from contracts import now_iso, ulid
 from memory.jsonl import read_records
 from memory.layout import ledger_dir
 from proc_utils import pid_alive
@@ -321,6 +330,91 @@ def _stream_metrics(client: redis.Redis, stream: str, group: str) -> dict:
     return out
 
 
+# ----------------------------------------------------------------------------- 飞书网页镜像
+_FEISHU_TOKEN_CACHE: dict[str, Any] = {"token": "", "expires_at": 0.0}
+_FEISHU_TOKEN_LOCK = threading.Lock()
+_FEISHU_ECHO_MAX_CHARS = 4000
+
+
+def _feishu_tenant_token() -> str:
+    """取 tenant_access_token（缓存到过期前 60s）。失败抛 RuntimeError。"""
+    now = time.monotonic()
+    with _FEISHU_TOKEN_LOCK:
+        cached = str(_FEISHU_TOKEN_CACHE.get("token") or "")
+        if cached and now < float(_FEISHU_TOKEN_CACHE.get("expires_at") or 0.0):
+            return cached
+        resp = requests.post(
+            f"{settings.feishu_domain.rstrip('/')}/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": settings.feishu_app_id, "app_secret": settings.feishu_app_secret},
+            timeout=15,
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            raise RuntimeError(f"token 接口返回非 JSON（HTTP {resp.status_code}）")
+        if resp.status_code != 200 or int(data.get("code") or 0) != 0:
+            raise RuntimeError(
+                f"token 获取失败 HTTP {resp.status_code} code={data.get('code')}: {data.get('msg')}"
+            )
+        token = str(data.get("tenant_access_token") or "")
+        if not token:
+            raise RuntimeError("token 接口未返回 tenant_access_token")
+        expire_s = max(int(data.get("expire") or 7200), 60)
+        _FEISHU_TOKEN_CACHE.update(token=token, expires_at=now + expire_s - 60)
+        return token
+
+
+def _send_feishu_echo(chat_id: str, text: str) -> dict:
+    """把网页里发出的用户原话，以机器人身份镜像到飞书会话。
+
+    这样手机端能看到「网页端发了什么」以及后续助理回复。发送失败不阻断网页入队，
+    由 `/api/messages` 把失败信息返回给前端展示。
+    """
+    if (settings.channel_kind or "").strip().lower() != "feishu":
+        return {"ok": False, "error": "not_feishu_channel"}
+    if not settings.feishu_app_id or not settings.feishu_app_secret:
+        return {"ok": False, "error": "feishu_not_configured"}
+    if not chat_id:
+        return {"ok": False, "error": "missing_chat_id"}
+
+    echo_text = f"【网页】{text}"
+    if len(echo_text) > _FEISHU_ECHO_MAX_CHARS:
+        echo_text = echo_text[: _FEISHU_ECHO_MAX_CHARS - 1] + "…"
+
+    try:
+        token = _feishu_tenant_token()
+        resp = requests.post(
+            f"{settings.feishu_domain.rstrip('/')}/open-apis/im/v1/messages"
+            "?receive_id_type=chat_id",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "receive_id": chat_id,
+                "msg_type": "text",
+                "content": json.dumps({"text": echo_text}, ensure_ascii=False),
+            },
+            timeout=20,
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            return {"ok": False, "error": f"feishu_http_{resp.status_code}_non_json"}
+        if resp.status_code != 200 or int(data.get("code") or 0) != 0:
+            msg = str(data.get("msg") or "")[:300]
+            return {
+                "ok": False,
+                "error": f"feishu_code={data.get('code')}: {msg}",
+                "code": data.get("code"),
+            }
+        return {
+            "ok": True,
+            "message_id": str((data.get("data") or {}).get("message_id") or ""),
+        }
+    except requests.RequestException as exc:
+        return {"ok": False, "error": f"network_error: {exc}"}
+    except Exception as exc:  # noqa: BLE001 - 镜像失败不能阻断网页消息
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def build_status(client: redis.Redis, reader: CheckpointReader) -> dict:
     router_state: dict[str, str] = {}
     heartbeat: Optional[str] = None
@@ -501,6 +595,113 @@ def create_app() -> FastAPI:
     async def api_status() -> dict:
         return await asyncio.to_thread(build_status, client, reader)
 
+    @app.post("/api/messages")
+    async def api_send_message(payload: dict = Body(...)) -> dict:
+        """网页发送：飞书镜像 + 写入 router stream。
+
+        网页消息不带飞书 `om_` message_id，因此 `message_id` 留空，ReplyUser 不会
+        尝试引用一条不存在的飞书消息；回复由 gateway 按 chat_id 直接发出。
+        """
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            return JSONResponse(
+                {"ok": False, "error": "empty_text", "message": "消息不能为空"},
+                status_code=400,
+            )
+        if len(text) > 8000:
+            return JSONResponse(
+                {"ok": False, "error": "text_too_long", "message": "单条网页消息最多 8000 字"},
+                status_code=400,
+            )
+
+        chat_id = str(payload.get("chat_id") or "").strip()
+        if not chat_id:
+            chat_id = str(
+                await asyncio.to_thread(
+                    lambda: client.hget(ROUTER_STATE_KEY, "last_chat_id") or ""
+                )
+            )
+        if not chat_id:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "no_chat_id",
+                    "message": "还没有可用的飞书会话；请先在飞书给机器人发一条消息",
+                },
+                status_code=400,
+            )
+
+        alive = await asyncio.to_thread(_gateway_alive)
+        if alive is False:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "gateway_offline",
+                    "message": "gateway 不在线，网页消息无法进入处理链路",
+                },
+                status_code=503,
+            )
+
+        # 先镜像到飞书，保证手机端先看到用户这条消息，再看到助理回复。
+        echo = await asyncio.to_thread(_send_feishu_echo, chat_id, text)
+
+        now_ms = int(time.time() * 1000)
+        web_message_id = ulid()
+        event = new_event(
+            "user_message",
+            "console",
+            {
+                "channel": "web",
+                "origin": "web",
+                "chat_id": chat_id,
+                "chat_type": "p2p",
+                "message_id": "",
+                "web_message_id": web_message_id,
+                "sender_id": "web-ui",
+                "thread_id": None,
+                "text": wrap_user_query(text, create_time_ms=now_ms),
+                "create_time": now_ms,
+            },
+            trace_id=ulid(),
+        )
+        try:
+            entry_id = await asyncio.to_thread(
+                lambda: client.xadd(
+                    ROUTER_STREAM,
+                    event_to_redis(event),
+                    maxlen=ROUTER_STREAM_MAXLEN,
+                    approximate=True,
+                )
+            )
+        except redis.RedisError as exc:
+            logger.error("网页消息写入 router stream 失败: %s", exc)
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "enqueue_failed",
+                    "message": f"写入 router stream 失败: {exc}",
+                },
+                status_code=503,
+            )
+
+        logger.info(
+            "网页消息入队 chat=%s entry=%s chars=%d echo_ok=%s",
+            chat_id,
+            entry_id,
+            len(text),
+            bool(echo.get("ok")),
+        )
+        return {
+            "ok": True,
+            "entry_id": str(entry_id),
+            "event_id": event.id,
+            "web_message_id": web_message_id,
+            "chat_id": chat_id,
+            "text": text,
+            "echo": echo,
+            "event": event.to_dict(),
+        }
+
     @app.get("/api/sessions")
     async def api_sessions(status: Optional[str] = None, limit: int = Query(50, le=200),
                            offset: int = 0) -> dict:
@@ -586,6 +787,41 @@ def create_app() -> FastAPI:
         return {"ok": True, "stream": stream, "items": await asyncio.to_thread(_read)}
 
     # ------------------------------------------------------------------ WebSocket
+    # ------------------------------------------------------------------ 文件预览 / 下载
+    @app.get("/api/files")
+    async def api_file(path: str = Query(...), download: bool = False):
+        """只读文件访问：仅允许 workspace / inbox / tool_outputs / workers 内的文件。
+
+        路径先 resolve 再判断前缀，符号链接逃逸也会被拒绝。返回原始文件（inline），
+        浏览器可直接预览图片/PDF；文本类由前端 fetch 后渲染。
+        """
+        raw = Path(str(path)).expanduser()
+        if not raw.is_absolute():
+            raw = Path(settings.workspace_root) / raw
+        try:
+            target = raw.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return JSONResponse({"ok": False, "error": "not_found", "path": str(raw)}, status_code=404)
+        roots = [
+            Path(settings.workspace_root).resolve(),
+            Path(settings.play_root_path).resolve(),
+            Path(settings.inbox_dir).resolve(),
+            Path(settings.tool_outputs_dir).resolve(),
+            Path(settings.workers_dir).resolve(),
+        ]
+        if not any(target == root or target.is_relative_to(root) for root in roots):
+            return JSONResponse(
+                {"ok": False, "error": "path_outside_roots", "path": str(target)},
+                status_code=403,
+            )
+        if not target.is_file():
+            return JSONResponse({"ok": False, "error": "not_a_file", "path": str(target)}, status_code=404)
+        return FileResponse(
+            str(target),
+            filename=target.name,
+            content_disposition_type="attachment" if download else "inline",
+        )
+
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:
         await ws.accept()
@@ -636,7 +872,7 @@ def create_app() -> FastAPI:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Web UI 协议适配器（只读观测控制台）")
+    parser = argparse.ArgumentParser(description="Web UI 协议适配器（观测 + 网页发送）")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（局域网访问用 0.0.0.0）")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()

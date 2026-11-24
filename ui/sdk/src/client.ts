@@ -8,6 +8,7 @@ import type {
   ClientFrame, ContextPage, EventsResponse, ListResponse,
   LogResponse, PageOpts, ScheduleItem, ServerFrame, SessionsPage,
   SessionDetail, StatusSnapshot, StreamEvent, TurnRecord, InboxRecord, WatchItem,
+  SendMessageResponse,
 } from "./types.js";
 
 export interface ClientOptions {
@@ -108,6 +109,14 @@ export class AssistantClient {
 
   status(): Promise<StatusSnapshot> {
     return this.get("/api/status");
+  }
+
+  /** 网页发送：后端会镜像到飞书会话，并写入 router stream。 */
+  sendMessage(text: string, chatId?: string): Promise<SendMessageResponse> {
+    return this.request<SendMessageResponse>("/api/messages", {
+      method: "POST",
+      body: JSON.stringify({ text, ...(chatId ? { chat_id: chatId } : {}) }),
+    });
   }
 
   sessions(opts: { status?: string; limit?: number; offset?: number } = {}): Promise<SessionsPage> {

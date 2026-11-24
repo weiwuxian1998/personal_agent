@@ -82,6 +82,64 @@ export function eventSummary(e: StreamEvent): string {
   return String(p.text ?? p.detail ?? p.prompt ?? "");
 }
 
+// ---------------------------------------------------------------- 文件引用 / 预览
+const PREVIEW_TEXT_EXT = new Set([
+  "md", "markdown", "txt", "json", "jsonl", "log", "py", "ts", "tsx", "js", "jsx",
+  "css", "html", "yml", "yaml", "csv", "tsv", "sql", "ini", "toml", "sh", "ps1",
+]);
+
+const PREVIEW_IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg"]);
+const PREVIEW_VIDEO_EXT = new Set(["mp4", "webm", "mov"]);
+const PREVIEW_AUDIO_EXT = new Set(["mp3", "wav", "ogg", "m4a"]);
+
+function fileExt(path: string): string {
+  const name = path.split(/[\\/]/).pop() ?? "";
+  const dot = name.lastIndexOf(".");
+  return dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
+}
+
+export function fileName(path: string): string {
+  return path.split(/[\\/]/).pop() || path;
+}
+
+/** 本地文件走 adapter 的只读预览接口；http(s) 原样返回。 */
+export function fileUrl(path: string, download = false): string {
+  if (/^https?:\/\//i.test(path)) return path;
+  const u = `/api/files?path=${encodeURIComponent(path)}`;
+  return download ? `${u}&download=true` : u;
+}
+
+export function fileKind(path: string): "image" | "pdf" | "video" | "audio" | "text" | "other" {
+  const ext = fileExt(path);
+  if (PREVIEW_IMAGE_EXT.has(ext)) return "image";
+  if (ext === "pdf") return "pdf";
+  if (PREVIEW_VIDEO_EXT.has(ext)) return "video";
+  if (PREVIEW_AUDIO_EXT.has(ext)) return "audio";
+  if (PREVIEW_TEXT_EXT.has(ext)) return "text";
+  return "other";
+}
+
+/** 从回复正文里提取被提及的本地文件路径（products/attachments 之外的兜底）。 */
+export function extractFileRefs(text: string): string[] {
+  const found = new Set<string>();
+  const backtick = /`([^`\n]+)`/g;
+  let m: RegExpExecArray | null;
+  while ((m = backtick.exec(text)) !== null) {
+    const raw = m[1].trim();
+    if (raw) found.add(raw);
+  }
+  // Windows 绝对路径；排除中文标点和常见句末符号，避免把「。报告」带进去
+  const winPath = /(?:^|[\s`"'（(])([A-Za-z]:\\[^\s`"'<>|（）()，。；、]+)/g;
+  while ((m = winPath.exec(text)) !== null) {
+    const raw = m[1].replace(/[.,;:]+$/, "");
+    if (raw) found.add(raw);
+  }
+  return [...found].filter((p) => {
+    if (/^https?:\/\//i.test(p)) return false;
+    return fileExt(p) !== "" && (PREVIEW_TEXT_EXT.has(fileExt(p)) || PREVIEW_IMAGE_EXT.has(fileExt(p)) || fileExt(p) === "pdf");
+  });
+}
+
 export const EVENT_TYPE_LABEL: Record<string, string> = {
   user_message: "用户",
   worker_result: "结果",

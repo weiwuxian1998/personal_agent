@@ -225,6 +225,110 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 .chat-msg.assistant .bubble { background: var(--bg); border: 1px solid var(--border); box-shadow: var(--shadow); }
 .chat-hint { padding: 8px 14px; border-top: 1px solid var(--border-soft); font-size: 11px; color: var(--text-3); flex: none; }
 
+/* 网页发送：输入区固定在对话面板底部 */
+.composer {
+  display: flex; gap: 8px; align-items: flex-end; flex: none;
+  padding: 10px 14px 4px; border-top: 1px solid var(--border-soft);
+}
+.composer textarea {
+  flex: 1; min-height: 40px; max-height: 120px; resize: none;
+  line-height: 1.5; padding: 9px 11px;
+}
+.composer .btn { height: 40px; flex: none; min-width: 70px; }
+.composer-hint { padding: 2px 14px 9px; font-size: 11px; color: var(--text-3); flex: none; }
+.composer-info { padding: 0 14px 4px; font-size: 11px; color: var(--green); flex: none; }
+.composer-error { padding: 0 14px 4px; font-size: 11px; color: var(--red); flex: none; }
+button.btn.primary {
+  background: var(--text); color: #fff; border-color: var(--text);
+}
+button.btn.primary:hover { background: #2a2a2a; }
+button.btn.primary:disabled { background: var(--text-3); border-color: var(--text-3); opacity: .55; }
+
+/* ---------------- 文件卡片 / 预览 ---------------- */
+.file-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.file-chip, .file-thumb {
+  border: 1px solid var(--border); background: var(--bg-subtle); color: var(--text-2);
+  border-radius: 8px; cursor: pointer; font-family: inherit; font-size: 12px;
+  padding: 5px 9px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.file-chip:hover, .file-thumb:hover { background: var(--bg-active); color: var(--text); }
+.file-thumb { padding: 3px; line-height: 0; }
+.file-thumb img { width: 76px; height: 76px; object-fit: cover; border-radius: 6px; display: block; }
+
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 100; background: rgba(0, 0, 0, .38);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+}
+.file-modal {
+  width: min(920px, 94vw); height: min(82vh, 820px); background: var(--bg);
+  border: 1px solid var(--border-strong); border-radius: 12px; overflow: hidden;
+  display: flex; flex-direction: column; box-shadow: 0 18px 60px rgba(0, 0, 0, .22);
+}
+.file-modal-head {
+  display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft); flex: none;
+}
+.file-modal-head .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-modal-head .btn { text-decoration: none; color: var(--text); flex: none; }
+.file-modal-body {
+  flex: 1; min-height: 0; overflow: auto; background: #fbfbfb;
+  display: flex; align-items: flex-start; justify-content: center; padding: 12px;
+}
+.file-modal-body img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.file-modal-body iframe { width: 100%; height: 100%; border: 0; background: #fff; }
+.file-html { min-height: 100%; }
+.file-markdown {
+  width: 100%; max-width: 860px; background: #fff; color: var(--text);
+  border: 1px solid var(--border-soft); border-radius: 8px;
+  padding: 20px 26px; font-size: 14px; line-height: 1.75; overflow-wrap: break-word;
+}
+.file-markdown h1, .file-markdown h2, .file-markdown h3, .file-markdown h4 {
+  margin: 1.2em 0 .55em; line-height: 1.35; letter-spacing: -.01em;
+}
+.file-markdown h1 { font-size: 1.55em; border-bottom: 1px solid var(--border-soft); padding-bottom: .3em; }
+.file-markdown h2 { font-size: 1.3em; border-bottom: 1px solid var(--border-soft); padding-bottom: .25em; }
+.file-markdown h3 { font-size: 1.1em; }
+.file-markdown p { margin: .65em 0; }
+.file-markdown ul, .file-markdown ol { padding-left: 1.6em; margin: .55em 0; }
+.file-markdown li { margin: .2em 0; }
+.file-markdown a { color: var(--blue); text-decoration: none; }
+.file-markdown a:hover { text-decoration: underline; }
+.file-markdown code {
+  font-family: var(--mono); font-size: .92em; background: var(--bg-subtle);
+  border: 1px solid var(--border-soft); border-radius: 4px; padding: .08em .35em;
+}
+.file-markdown pre {
+  margin: .9em 0; padding: 12px 14px; overflow: auto; background: var(--bg-subtle);
+  border: 1px solid var(--border-soft); border-radius: 8px;
+  font-family: var(--mono); font-size: 12px; line-height: 1.6;
+}
+.file-markdown pre code { border: 0; padding: 0; background: transparent; }
+.file-markdown blockquote {
+  margin: .8em 0; padding: .3em 1em; border-left: 3px solid var(--border-strong);
+  background: var(--bg-subtle); color: var(--text-2);
+}
+.file-markdown table { border-collapse: collapse; margin: .9em 0; max-width: 100%; }
+.file-markdown th, .file-markdown td { border: 1px solid var(--border); padding: 5px 10px; }
+.file-markdown th { background: var(--bg-subtle); font-weight: 600; }
+.file-markdown img { max-width: 100%; height: auto; border-radius: 6px; }
+.file-markdown hr { border: 0; border-top: 1px solid var(--border-soft); margin: 1.4em 0; }
+.file-modal-body video { max-width: 100%; max-height: 100%; }
+.file-modal-body audio { width: min(520px, 100%); margin-top: 24px; }
+.file-preview-text {
+  width: 100%; margin: 0; padding: 14px; white-space: pre-wrap; word-break: break-word;
+  font-family: var(--mono); font-size: 12px; line-height: 1.65; color: var(--text-2);
+  background: var(--bg); border: 1px solid var(--border-soft); border-radius: 8px;
+}
+.file-modal-path {
+  padding: 7px 14px; border-top: 1px solid var(--border-soft); color: var(--text-3);
+  font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none;
+}
+
+@media (max-width: 640px) {
+  .modal-backdrop { padding: 10px; }
+  .file-modal { width: 100%; height: 86vh; }
+}
+
 .feed-item {
   padding: 7px 8px; border-radius: 8px; font-size: 12px;
   display: flex; gap: 8px; align-items: baseline; cursor: pointer;

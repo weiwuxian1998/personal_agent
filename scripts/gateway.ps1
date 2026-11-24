@@ -30,8 +30,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$ProjectDir = 'D:\personal_agent'
-$PythonExe  = 'C:\Users\34897\miniconda3\envs\feishu\python.exe'
+$ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$PythonExe  = 'C:\Users\wangzs\anaconda3\envs\assistant\python.exe'
 $LogFile    = Join-Path $ProjectDir 'logs\gateway-live.log'
 $PidFile    = Join-Path $ProjectDir 'logs\gateway.pid'
 
@@ -167,7 +167,7 @@ function Start-Gateway {
     # The .cmd wrapper only redirects output; it keeps cmd /c quoting simple.
     $runner = Join-Path $ProjectDir 'scripts\gateway-run.cmd'
     $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-        CommandLine      = ('cmd.exe /c "{0}"' -f $runner)
+        CommandLine      = ('cmd.exe /c ""{0}" "{1}""' -f $runner, $PythonExe)
         CurrentDirectory = $ProjectDir
     }
     if ($result.ReturnValue -ne 0) {

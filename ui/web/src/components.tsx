@@ -59,9 +59,15 @@ export function StatusCard({ status, connected }: { status: StatusSnapshot | nul
       <div className="sc-title">系统状态</div>
       <div className="sc-row"><Dot state={gw === true ? "ok" : gw === false ? "bad" : "warn"} />网关<span className="v">{gw === true ? "在线" : gw === false ? "离线" : "未知"}</span></div>
       <div className="sc-row"><Dot state={router?.state ?? "idle"} />Router<span className="v">{router?.label ?? "…"}</span></div>
-      <div className="sc-row"><Dot state={status?.redis_ok ? "ok" : "bad"} />Redis<span className="v">{status?.redis_ok ? "正常" : "异常"}</span></div>
-      <div className="sc-row"><Dot state={status?.postgres_ok ? "ok" : "bad"} />Postgres<span className="v">{status?.postgres_ok ? "正常" : "异常"}</span></div>
+      <div className="sc-row"><Dot state={status ? (status.redis_ok ? "ok" : "bad") : "idle"} />Redis<span className="v">{status ? (status.redis_ok ? "正常" : "异常") : "…"}</span></div>
+      <div className="sc-row"><Dot state={status ? (status.postgres_ok ? "ok" : "bad") : "idle"} />Postgres<span className="v">{status ? (status.postgres_ok ? "正常" : "异常") : "…"}</span></div>
       <div className="sc-row"><Dot state={connected ? "ok" : "bad"} />WebSocket<span className="v">{connected ? "已连接" : "重连中"}</span></div>
+      <div className="sc-sep" />
+      <div className="sc-section">运行指标</div>
+      <div className="sc-row">积压<span className="v">{status?.router.stream.lag ?? "…"}</span></div>
+      <div className="sc-row">待确认<span className="v">{status?.router.stream.pending ?? "…"}</span></div>
+      <div className="sc-row">运行中任务<span className="v">{status?.counts.sessions_running ?? "…"}</span></div>
+      <div className="sc-row">活跃定时<span className="v">{status?.counts.schedules_active ?? "…"}</span></div>
     </div>
   );
 }

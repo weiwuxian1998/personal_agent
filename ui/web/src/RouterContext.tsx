@@ -3,6 +3,9 @@ import type { ContextPage, TurnRecord } from "@personal-assistant/client";
 import { client, fmtDateTime } from "./lib.js";
 import { MessageList } from "./components.js";
 
+/** Router 上下文消息列表上限：只保留最近 300 条，避免大 checkpoint 拖慢页面。 */
+const MAX_ROUTER_MESSAGES = 300;
+
 export default function RouterContext() {
   const [sub, setSub] = useState<"turns" | "messages">("turns");
   return (
@@ -88,17 +91,20 @@ function Messages() {
 
   async function loadEarlier() {
     if (!page?.next_cursor) return;
+    if (older.length + (page?.messages.length ?? 0) >= MAX_ROUTER_MESSAGES) return;
     setLoading(true);
     try {
       const r = await client.routerContext({ cursor: page.next_cursor, limit: 50, includeTools });
-      setOlder((prev) => [...r.messages, ...prev]);
+      setOlder((prev) => [...r.messages, ...prev].slice(-MAX_ROUTER_MESSAGES));
       setPage({ ...page, next_cursor: r.next_cursor });
     } finally {
       setLoading(false);
     }
   }
 
-  const messages = [...older, ...(page?.messages ?? [])];
+  const allMessages = [...older, ...(page?.messages ?? [])];
+  const messages = allMessages.slice(-MAX_ROUTER_MESSAGES);
+  const atLimit = allMessages.length >= MAX_ROUTER_MESSAGES;
 
   return (
     <>
@@ -110,11 +116,12 @@ function Messages() {
         {page && (
           <span className="dim small">
             共 {page.total} 条 · 已显示 {messages.length} 条
+            {atLimit && <> · 仅保留最近 {MAX_ROUTER_MESSAGES} 条</>}
             {page.checkpoint && <> · checkpoint step {page.checkpoint.step} · {fmtDateTime(page.checkpoint.ts)}</>}
           </span>
         )}
         <span className="spacer" />
-        {page?.next_cursor && <button className="btn" onClick={() => void loadEarlier()} disabled={loading}>加载更早 ↑</button>}
+        {page?.next_cursor && !atLimit && <button className="btn" onClick={() => void loadEarlier()} disabled={loading}>加载更早 ↑</button>}
       </div>
       {page?.source === "none" && <div className="card dim">{page.note}</div>}
       <MessageList messages={messages} />
